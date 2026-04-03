@@ -39,7 +39,7 @@ else
 fi
 
 # 2. Symlink enforce-ship hook
-# Check standalone layout (ship-skill repo) first, then ai-brain layout
+# Check standalone layout (ship-skill repo) first, then parent repo layout
 HOOK_SEARCH_1="$SKILL_DIR/hooks/enforce-ship.sh"
 HOOK_SEARCH_2="$(cd "$SKILL_DIR/../.." 2>/dev/null && pwd)/hooks/enforce-ship.sh"
 if [ -f "$HOOK_SEARCH_1" ]; then

@@ -17,7 +17,7 @@ Run each check. Record result as PASS / FAIL / WARN.
 
 | # | Check | How to verify | Severity |
 |---|-------|---------------|----------|
-| D1 | Lives in `ai-brain/skills/{name}/` | Check path | FAIL |
+| D1 | Lives in the skills source directory `skills/{name}/` | Check path | FAIL |
 | D2 | Symlinked from `~/.claude/skills/{name}` | `ls -la` symlink | FAIL |
 | D3 | No double-nesting | Skill dir should NOT contain another dir with same name holding SKILL.md | FAIL |
 | D4 | No extraneous files | No README.md, CHANGELOG.md, INSTALLATION_GUIDE.md, QUICK_REFERENCE.md | WARN |
@@ -40,7 +40,7 @@ Run each check. Record result as PASS / FAIL / WARN.
 | I1 | Run data has meaningful outcome values | data.json runs have distinct outcome strings (not all identical) | WARN |
 | I2 | Run data captures actionable metrics | data.json run entries have 3+ metric fields beyond timestamp/outcome | WARN |
 | I3 | Skill workflow has distinct stages | SKILL.md has numbered steps or named stages | WARN |
-| I4 | No hardcoded paths or secrets | Grep SKILL.md for absolute paths outside ai-brain or tokens | FAIL |
+| I4 | No hardcoded paths or secrets | Grep SKILL.md for absolute paths outside the skills repo or tokens | FAIL |
 
 ## Severity Guide
 
@@ -51,7 +51,7 @@ Run each check. Record result as PASS / FAIL / WARN.
 
 The following issues can be auto-fixed by the audit:
 
-- D1 + D2: Move skill to ai-brain/skills/ and create symlink
+- D1 + D2: Move skill to the skills source directory and create symlink
 - D3: Flatten double-nested directory
 - R2-R4: Create missing runs/ directory and initial files
 - R1: Append a Run Data Recording section template (requires human review of metrics)

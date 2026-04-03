@@ -200,7 +200,7 @@ git branch -d {branch} 2>/dev/null   # delete local if still exists
 rm -f .ai-workspace/ship-verified-{pr-number}   # clean up verification marker
 ```
 
-**Auto-publish skills** (conditional): If `scripts/publish-skills.sh` exists in the repo root AND the merged PR touched files under `skills/`, run the publish script. Log the result but do not fail the pipeline if publishing fails. This only triggers in repos that have the publish script (e.g., ai-brain).
+**Auto-publish skills** (conditional): If `scripts/publish-skills.sh` exists in the repo root AND the merged PR touched files under `skills/`, run the publish script. Log the result but do not fail the pipeline if publishing fails. This only triggers in repos that have the publish script.
 
 **Persist run data** (see Run Data Recording section below), then print a final summary:
 - PR URL and merge commit SHA
