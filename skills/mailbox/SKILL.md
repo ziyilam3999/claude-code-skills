@@ -315,7 +315,7 @@ Write a structured handoff message for session-to-session work transfer.
 
 After the mailbox operation completes (or errors out), persist run data. This section always runs.
 
-**Resolve the skill base directory** from the symlink target (claude-code-mailbox/skills/mailbox/), not the current working directory.
+**Resolve the skill base directory** from the symlink target (the skill's source directory), not the current working directory.
 
 ### What to record
 

@@ -91,7 +91,7 @@ gh pr checks {pr-number}
      a. Print: `"Code-review CI failed — checking OAuth token freshness..."`
      b. Read `$USERPROFILE/.claude/.credentials.json`, extract `claudeAiOauth.expiresAt` (unix ms).
      c. If token is **expired or expiring within 30 minutes**:
-        - Run the OAuth token sync script: `bash "$(git rev-parse --show-toplevel)/tools/sync-oauth-token.sh"` (if available)
+        - Look for the OAuth token sync script at `"$(readlink -f ~/.claude/skills/ship)/../../tools/sync-oauth-token.sh"` (resolved via the skill's symlink, not the current repo). If the script exists, run it. If not found, skip sync and abort as normal.
         - If sync succeeds: re-trigger with `gh run rerun --failed -R {owner/repo}` on the failing run, record `ciOauthSynced: true` and `ciRetried: true`, reset CI poll timer, **resume polling** (fresh 10-min timeout).
         - If sync fails: report the sync error and abort.
      d. If token is **fresh** (>30 min remaining): not a token issue — abort as normal.
