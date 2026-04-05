@@ -63,11 +63,11 @@ Read `{MAILBOX_REPO}/.ai-workspace/.mailbox-agents.json`.
 
 ### Step 3: Resolve name
 
-**Important:** Only use the sources listed below to determine the agent name. Do NOT use project memory, auto-memory files, or context from prior conversations. Agent names are session-scoped and must come from: (1) the user explicitly saying "Your name is X" in THIS conversation, (2) the registry entry for THIS session ID, or (3) fresh generation.
+**Important:** Only use the sources listed below to determine the agent name. Do NOT use project memory, auto-memory files, or context from prior conversations. Agent names are session-scoped and must come from: (1) the user, initial prompt, or project CLAUDE.md saying "Your name is X" or "Your mailbox name is X", (2) the registry entry for THIS session ID, or (3) fresh generation.
 
 **Never save agent names to memory.** Do not write your own or any other agent's name to Claude Code memory files (auto-memory, project memory, MEMORY.md, etc.). Names are session-scoped and will mislead future sessions. The registry is the only persistence mechanism for agent names.
 
-1. If the user already said "Your name is X" earlier in this conversation, use X
+1. If the user, initial prompt, or project CLAUDE.md says "Your name is X" or "Your mailbox name is X", use X
    -- read the existing registry JSON, set ONLY the key `"<session-id>"` to `"X"`, write back the complete registry (preserving all other entries)
 2. If the session ID is `"default"` (hook did not fire): **skip the registry lookup**.
    Generate a new name (step 5 below) and write it to the registry under key `"default"`.
@@ -101,6 +101,26 @@ Names are **persisted per-session** in the registry. This means:
 - **`dispatch`**: Messages addressed to `dispatch` are read by Dispatch (cloud) sessions. When checking messages, Dispatch sessions should match `to:` against their own name, `all`, AND `dispatch`.
 
 When sending to a Dispatch (cloud) session, address the message `to: dispatch`.
+
+## Remote Trigger Integration
+
+Remote triggers (scheduled agents via `RemoteTrigger` API) get a new session ID on
+every run, which breaks registry-based name persistence. To give a trigger a stable
+mailbox name, include this directive in the trigger's `prompt` field:
+
+    Your mailbox name is {name}. [rest of prompt]
+
+This is handled by priority rule #1 in name resolution. The name is written to the
+registry on each run (keyed by that run's session ID), keeping the registry current.
+
+When creating triggers via `RemoteTrigger create`, always include this directive:
+
+```json
+{
+  "prompt": "Your mailbox name is swift-grace. Check mailbox and process bug reports.",
+  "cronExpression": "0 8 * * *"
+}
+```
 
 ## Transport Mode Detection
 
