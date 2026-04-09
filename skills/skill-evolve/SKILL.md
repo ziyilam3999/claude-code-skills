@@ -182,7 +182,7 @@ Append to `runs/data.json` (create with `{"skill":"skill-evolve","lastRun":null,
 - `no-action` -- nothing to do (e.g., improve with insufficient data)
 - `error` -- subcommand could not complete
 
-Keep last 20 runs. Set `lastRun` and increment `totalRuns`.
+Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```

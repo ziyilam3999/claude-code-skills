@@ -209,7 +209,7 @@ Append to `runs/data.json` (create with `{"skill":"double-critique","lastRun":nu
 - `no-issues` — review ran, zero findings
 - `error` — skill could not complete (file not found, agent failure, etc.)
 
-Keep last 20 runs. Set `lastRun` and increment `totalRuns`.
+Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```

@@ -32,8 +32,7 @@ Before any mailbox operation, determine the mailbox repo path (`MAILBOX_REPO`).
    ```bash
    mkdir -p ~/claude-code-mailbox/mailbox/inbox ~/claude-code-mailbox/mailbox/archive
    cd ~/claude-code-mailbox && git init
-   echo ".ai-workspace/.current-session-id" > .gitignore
-   echo ".ai-workspace/sessions/" >> .gitignore
+   echo ".ai-workspace/sessions/" > .gitignore
    git add -A && git commit -m "chore: initialize mailbox"
    echo "$(cd ~/claude-code-mailbox && pwd)" > ~/.mailbox-repo
    ```
@@ -47,12 +46,22 @@ On every `/mailbox` invocation, resolve the agent name using session-scoped iden
 
 ### Step 1: Read session ID
 
-1. If you already memorized a session ID earlier in this conversation, use it (skip to Step 2).
-2. Otherwise, read `.ai-workspace/.current-session-id` from the **current project root** (not the mailbox repo).
-   - The PreToolUse hook fires synchronously for THIS session, so the file is accurate right now.
-   - Memorize this value: "My session ID is {id}" -- use it for ALL subsequent `/mailbox` calls in this conversation.
-   - If the file does not exist, set session ID to `"default"`.
-3. **Validate:** Check that `.ai-workspace/sessions/{session-id}` exists as a file in the current project root. If not, the ID may be stale (written by a different session) -- re-read `.current-session-id` and update your memorized value. If validation still fails, proceed with the current ID (the hook may not have created per-session files yet).
+Session IDs are delivered to each session privately via the `SessionStart`
+hook (`inject-session-id.sh`), which injects a line of the form
+`MAILBOX_SESSION_ID={id}` into that session's additionalContext at boot.
+This is the authoritative source — it cannot be overwritten by other
+terminals running in the same project directory.
+
+Priority order:
+
+1. **If a `MAILBOX_SESSION_ID=...` line appeared in this session's SessionStart context, use that value.** It is authoritative and session-private. Memorize it: "My session ID is {id}" — use it for ALL subsequent `/mailbox` calls in this conversation.
+2. Else if you already memorized a session ID earlier in this conversation, use it.
+3. Else (legacy fallback — SessionStart hook did not run, e.g. older Claude Code, or Windows terminal that skipped the hook): list files in `.ai-workspace/sessions/` of the **current project root** and pick the most recently modified filename as the session ID. **Warn the user**: "⚠ SessionStart hook did not deliver MAILBOX_SESSION_ID; falling back to most-recent sessions/ file. If you have multiple terminals open in the same project, identities may collide — restart terminals to pick up the hook."
+4. Else set session ID to `"default"`.
+
+Do not re-read any shared singleton file like `.current-session-id`. That
+path was removed because it was a last-writer-wins collision point between
+terminals sharing a project directory.
 
 ### Step 2: Read agent registry
 
@@ -160,8 +169,16 @@ Before each send/check/handoff operation, determine whether to use **local mode*
 ### Fallback
 
 If any detection step fails (command errors, missing files, parse failures),
-default to **git mode**. It is always safe to push/pull; it is never safe to
-skip when uncertain.
+default to **git mode**. It is always safe to *attempt* push/pull; if push
+fails (e.g., archived remote, network error), warn and continue — the message
+is committed locally. It is never safe to skip when uncertain.
+
+### Push Failure Recovery
+
+After any `git push` failure in git mode:
+1. Do NOT fail the send/check operation — the message/archive is committed locally
+2. Warn the user: "⚠ Push failed — message committed locally but Dispatch sessions may not see it"
+3. Log in run data with issue: "git push failed: {error summary}"
 
 ## Subcommands
 
@@ -176,7 +193,30 @@ Write and deliver a message.
    - Otherwise: ask "Who should this be addressed to?"
 3. Determine message content:
    - If user provided content inline: use it
-   - Otherwise: compose based on conversation context (what has been done, current state, what the receiver needs to know)
+   - Otherwise: compose using the checklist below
+
+   **Compose checklist — mentally simulate: "The receiver has zero context from my
+   conversation. What do they need to understand and act without asking follow-ups?"**
+
+   Include every applicable item:
+
+   | Category | Include |
+   |----------|---------|
+   | **Identity** | What project/repo, what branch, what PR (URL if exists) |
+   | **Action done** | What you completed — concrete results, not just "I looked into it" |
+   | **Evidence** | Metrics, test results, audit scores, error messages — paste actual values |
+   | **Decisions** | Design choices made and *why*, alternatives rejected |
+   | **Artifacts** | URLs (PRs, deploys, previews), file paths changed, commands to run |
+   | **Current state** | What is working now, what is not, any blockers |
+   | **Ask / Next step** | Exactly what you need from the receiver, or what they should do next |
+
+   **Anti-patterns (from KB F7, F11, F13):**
+   - "I made some improvements" → say *what* improvements with *what* effect
+   - "There were a few issues" → list each issue with its resolution
+   - "See the PR" → include key changes inline; receiver may not have repo access yet
+   - "As discussed" / "as mentioned" → never reference prior conversation; inline all context
+   - Vague status without counts → use mechanical clarity: "3/5 tests pass", "PASS", "12 files"
+   - Sending a status without metrics when metrics exist in your conversation
 4. Write message file to `{MAILBOX_REPO}/mailbox/inbox/`:
 
    **Filename:** `{YYYY-MM-DDTHHMM}-{from}-to-{to}-{subject-slug}.md`
@@ -193,7 +233,7 @@ Write and deliver a message.
    status: unread
    ---
 
-   {message body -- self-contained, includes all context the receiver needs}
+   {message body -- use the compose checklist above; receiver has zero context}
    ```
 
 5. Run Transport Mode Detection (send). Then git operations in the mailbox repo:
@@ -206,7 +246,7 @@ Write and deliver a message.
    git pull --rebase
    git add mailbox/inbox/{filename}
    git commit -m "mailbox: {from} -> {to}: {subject}"
-   git push
+   git push 2>&1 || echo "⚠ Push failed — message committed locally but Dispatch sessions may not see it."
    ```
 
    **Local mode:**
@@ -261,7 +301,7 @@ Read and archive incoming messages.
    ```
    **Git mode only** (any processed message was from a non-local agent):
    ```
-   git push
+   git push 2>&1 || echo "⚠ Push failed — archive committed locally but remote sync failed."
    ```
 7. **Verify archive:** Confirm no processed messages remain in `mailbox/inbox/` for this agent. If any do, run `git mv` now, then `git add mailbox/ && git commit -m "mailbox: archive missed files"`. Only run `git push` if in git mode.
 8. If no messages found: print `No new messages for {agent-name}.`
@@ -364,7 +404,7 @@ Append to `runs/data.json` (create with `{"skill":"mailbox","lastRun":null,"tota
 - `no-action` — no messages to process or no action taken (e.g., `/mailbox check` with empty inbox)
 - `error` — skill could not complete (mailbox repo not found, git failure, etc.)
 
-Keep last 20 runs. Set `lastRun` and increment `totalRuns`.
+Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```

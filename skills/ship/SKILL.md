@@ -91,7 +91,7 @@ gh pr checks {pr-number}
      a. Print: `"Code-review CI failed — checking OAuth token freshness..."`
      b. Read `$USERPROFILE/.claude/.credentials.json`, extract `claudeAiOauth.expiresAt` (unix ms).
      c. If token is **expired or expiring within 30 minutes**:
-        - Look for the OAuth token sync script at `"$(readlink -f ~/.claude/skills/ship)/../../tools/sync-oauth-token.sh"` (resolved via the skill's symlink, not the current repo). If the script exists, run it. If not found, skip sync and abort as normal.
+        - Look for the OAuth token sync script at `~/.claude/skills/housekeep/tools/sync-oauth-token.sh` (resolved via the housekeep skill symlink, not the current repo). If the script exists, run it. If not found, skip sync and abort as normal.
         - If sync succeeds: re-trigger with `gh run rerun --failed -R {owner/repo}` on the failing run, record `ciOauthSynced: true` and `ciRetried: true`, reset CI poll timer, **resume polling** (fresh 10-min timeout).
         - If sync fails: report the sync error and abort.
      d. If token is **fresh** (>30 min remaining): not a token issue — abort as normal.
@@ -274,7 +274,7 @@ For aborted runs, also set:
 
 All paths are relative to this skill's base directory (resolved from the symlink, i.e., the skill's source directory):
 
-1. **`runs/data.json`** — Read the existing file (create if missing with `{"skill":"ship","lastRun":null,"totalRuns":0,"runs":[]}`). Append the new run record to the `runs` array. If `runs.length > 20`, remove the oldest entries to keep exactly 20. Increment `totalRuns` by 1. Set `lastRun` to the run's timestamp. Write the file.
+1. **`runs/data.json`** — Read the existing file (create if missing with `{"skill":"ship","lastRun":null,"totalRuns":0,"runs":[]}`). Append the new run record to the `runs` array. If `runs.length > 20`, remove the oldest entries to keep exactly 20 (older runs are permanently discarded). Increment `totalRuns` by 1. Set `lastRun` to the run's timestamp. Write the file.
 
 2. **`runs/run.log`** — Append one line: `{timestamp} | {outcome} | {durationSeconds}s | {summary}`. If the log exceeds 100 lines, trim the oldest lines to keep exactly 100.
 

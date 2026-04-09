@@ -228,7 +228,7 @@ Append to `runs/data.json` (create with `{"skill":"skeptical-code-reviewer","las
 }
 ```
 
-Keep last 20 runs. Set `lastRun` and increment `totalRuns`.
+Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```
