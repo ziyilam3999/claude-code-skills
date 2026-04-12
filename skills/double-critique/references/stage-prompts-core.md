@@ -1,6 +1,6 @@
-# Stage Prompts — Core Pipeline (Stages 1-6)
+# Stage Prompts — Core Pipeline (Stages 1-2 + Critic-N / Corrector-N loop)
 
-Full prompts for each agent in the core critique pipeline. The orchestrator (SKILL.md) calls each stage sequentially, passing only file artifacts between them.
+Full prompts for each agent in the core critique pipeline. The orchestrator (SKILL.md) calls each stage sequentially, passing only file artifacts between them. Stages 1-2 (Researcher, Drafter) run once. The Critic-N / Corrector-N pair runs in a loop bounded by `max_rounds`, with exit conditions defined in SKILL.md.
 
 ---
 
@@ -174,58 +174,80 @@ Write the output to `tmp/dc-2-drafter.md`.
 
 ---
 
-## Stage 3 — CRITIC-1 (ISOLATED)
+## Critic-N (ISOLATED) — Loop Template
 
-Isolation is what makes the critique valuable — if the critic sees the reasoning behind changes, it unconsciously confirms them instead of challenging them. A cold reviewer who sees only the draft catches problems the author is blind to.
+This is the template for every critic round in the loop. The orchestrator substitutes `{N}` with the current round number and `{CORRECTED_DOC_PATH}` with the latest corrected-doc path (round 1 reads `tmp/dc-2-drafter.md`; round ≥2 reads the previous round's corrector output).
+
+Isolation is what makes the critique valuable — if the critic sees the reasoning behind changes, it unconsciously confirms them instead of challenging them. A cold reviewer who sees only the latest corrected doc catches problems the author is blind to. **Each round is fully independent: the critic never sees prior rounds' critiques, running issue lists, or round counters.**
 
 Use the Agent tool with this prompt:
 
-> You're a fresh reviewer seeing this document for the first time. You know NOTHING about how it was made.
+> You're a fresh reviewer seeing this document for the first time. You know NOTHING about how it was made, what round of review this is, or what prior reviewers found. Do not attempt to coordinate with any other round.
 >
-> Read `tmp/dc-2-drafter.md`. Read it cold.
+> Read the document at `{CORRECTED_DOC_PATH}`. Read it cold.
+>
+> Read the severity rubric at `references/severity-rubric.md`. This rubric defines the severity levels (CRITICAL / MAJOR / MINOR), the `blocks_ship` flag, the evidence requirement, and the required JSON output schema. Your output MUST conform to that schema exactly.
 >
 > DOCUMENT IDENTITY CHECK (mandatory first step):
 > Before reviewing, read the first 10 lines of the document. State the document's
 > title and date. If the document appears to be about a completely different topic
-> than what `tmp/dc-2-drafter.md` should contain (a revised version of a document
-> that was critiqued in this pipeline run), STOP immediately and report:
-> `IDENTITY MISMATCH: Expected a document from this pipeline run. Found: [title/topic].
-> This file may be stale from a prior run. Aborting critique.`
-> Write this mismatch report to the output file and do not proceed with the review.
+> than what you would expect from a document currently under critique in this
+> pipeline run, STOP immediately and write this single-finding output file:
+> ```json
+> [{"id":"IDENTITY","severity":"CRITICAL","blocks_ship":true,"novel":false,"evidence":"lines 1-10 of the input","finding":"IDENTITY MISMATCH: found [title/topic]; expected a document from this pipeline run","why_blocks_ship":"Stale input would cause the orchestrator to rewrite the wrong file."}]
+> ```
+> Do not proceed with the review.
 >
 > Find:
 > - Logical gaps or leaps in reasoning
 > - Unsupported claims (stated without evidence)
 > - Missing edge cases or failure modes
 > - Internal contradictions
-> - Things that don't make sense or feel hand-wavy
+> - Implementation details that don't add up
+> - Feasibility issues — things that SOUND right but WON'T WORK in practice
+> - Overly vague items that need specifics
+> - Ordering or dependency issues
 >
-> For each finding:
-> - Cite the exact section/line
-> - Classify as CRITICAL, MAJOR, or MINOR
-> - Suggest a specific fix
+> EVIDENCE GATING (hard rule from the rubric):
+> - Every finding must carry an `evidence` field pointing at concrete text in the document (quoted span + line or section reference), OR the literal string `UNVERIFIED`.
+> - `UNVERIFIED` findings are allowed when you suspect a problem but cannot cite evidence. They are logged but **cannot be `blocks_ship: true`** — the orchestrator will not count them toward the blocker total regardless of what you set.
+> - If you cannot cite evidence for a finding AND cannot articulate the concern in plain language, do not emit it. Silence is better than noise.
 >
-> If you can't explain why something is a problem in plain language, it might not be a real problem. Only flag what you can clearly articulate.
+> `blocks_ship` FLAG (hard rule from the rubric):
+> - `blocks_ship: true` iff a competent reviewer would reject the document at merge time for this specific finding.
+> - Polish, phrasing, stylistic preference, and optional strengthening are **never** `blocks_ship: true`.
+> - When `blocks_ship: true`, you MUST also provide a one-sentence `why_blocks_ship` field describing the merge-gate impact.
+>
+> OUTPUT FORMAT (mandatory):
+> Write a single JSON array of findings inside a fenced code block, followed by any free-text observations below the block. The orchestrator parses the JSON array only — free text is for the user. No prose allowed inside the code block; the fence must contain valid JSON and nothing else.
 
-Write the output to `tmp/dc-3-critic1.md`.
+Write the output to `tmp/dc-{2*N+1}-critic-round{N}.md`.
 
 ---
 
-## Stage 4 — CORRECTOR-1
+## Corrector-N — Loop Template
+
+This is the template for every corrector round in the loop. The orchestrator substitutes `{N}` with the current round number, `{CORRECTED_DOC_PATH}` with the latest corrected doc path, and `{CRITIC_FINDINGS_PATH}` with `tmp/dc-{2*N+1}-critic-round{N}.md`.
 
 Use the Agent tool with this prompt:
 
 > You're a surgeon. Read:
-> - The draft at `tmp/dc-2-drafter.md`
-> - The critique at `tmp/dc-3-critic1.md`
+> - The latest corrected document at `{CORRECTED_DOC_PATH}`
+> - The critic findings at `{CRITIC_FINDINGS_PATH}`. The findings are a JSON array inside a fenced code block — parse them.
 >
-> For each finding:
-> - If valid: apply the fix precisely
-> - If wrong: explain why in plain language
+> APPLY FIXES ONLY TO BLOCKING FINDINGS:
+> - For each finding where `blocks_ship == true`: apply the fix precisely. Do not add new content beyond what the finding requires.
+> - For each finding where `blocks_ship == false` (MINOR, polish, non-blocking): **do NOT fix it.** Instead, append the finding as a comment inside a block at the very end of the document:
+>   ```
+>   <!-- deferred:critic-{N}
+>   - [F#] <finding text>
+>   ...
+>   -->
+>   ```
+>   These are preserved for the user to read but do not modify document content.
+> - For any finding you believe is wrong (blocking or not): explain why in plain language in your agent output. Do NOT silently skip a `blocks_ship: true` finding.
 >
-> Produce a corrected version. Don't introduce new content — only fix what was flagged. Don't over-correct: if a MINOR finding doesn't actually improve the document, skip it with a note.
->
-> SECOND-ORDER EFFECT CHECK (mandatory after applying each fix):
+> SECOND-ORDER EFFECT CHECK (mandatory after applying each blocking fix):
 > After applying each fix, check all four dimensions and write:
 > ```
 > SIDE-EFFECT-CHECK: [fix description]
@@ -234,81 +256,18 @@ Use the Agent tool with this prompt:
 >   shape:  ok | "<what field/type changed and where consumers were updated>"
 >   refs:   ok | "<what cross-references were updated>"
 > ```
-> - **format:** File format changes (JSON↔JSONL, YAML↔JSON) — update extensions everywhere
-> - **naming:** Renames (variables, keys, files) — update all references to old name
-> - **shape:** Data shape changes (fields added/removed) — update all consumers
-> - **refs:** Cross-references (imports, config paths, doc links) — still valid?
 > Use `ok` when unaffected. When affected, quote what changed and where.
 >
 > TC RE-CHECK (mandatory when the corrected document contains test cases):
 > After applying all fixes, re-run the TC-CHECK. For each TC, write:
 > `TC-CHECK: [TC name] — ESM:ok/fail, target:ok/fail, ext:ok/fail, precond:ok/fail, async:ok/fail/n/a, cleanup:ok/fail/n/a, paths:ok/fail/n/a`
-> Fixes may introduce new TC issues (e.g., converting require() to import but forgetting
-> top-level await). Fix any failures before proceeding.
+> Fix any failures before proceeding.
 >
 > Apply the self-review checklist from `references/self-review-checklist.md` after applying all fixes.
 > CRITICAL: For item 5 (evidence-gated verification), you MUST use the format
 > `VERIFIED: <thing> found at <file:line> — "<quoted evidence>"` or `UNVERIFIED: could not locate <thing>`.
 > Never claim "I verified X" without pasting the actual evidence.
-
-Write the output to `tmp/dc-4-corrector1.md`.
-
----
-
-## Stage 5 — CRITIC-2 (ISOLATED)
-
-Same isolation principle as Critic-1. This second cold reviewer catches problems introduced by Round 1 corrections — fixes often have side effects that the fixer can't see because they're too close to the changes.
-
-Use the Agent tool with this prompt:
-
-> You're a fresh reviewer seeing this document for the first time. You know NOTHING about its history or how it was produced.
 >
-> Read `tmp/dc-4-corrector1.md`. Read it cold.
->
-> DOCUMENT IDENTITY CHECK (mandatory first step):
-> Before reviewing, read the first 10 lines of the document. State the document's
-> title and date. If the document appears to be about a completely different topic
-> than what `tmp/dc-4-corrector1.md` should contain (a corrected version of a document
-> that was critiqued in this pipeline run), STOP immediately and report:
-> `IDENTITY MISMATCH: Expected a document from this pipeline run. Found: [title/topic].
-> This file may be stale from a prior run. Aborting critique.`
-> Write this mismatch report to the output file and do not proceed with the review.
->
-> Find:
-> - Implementation details that don't add up
-> - Edge cases missed
-> - Feasibility issues — things that SOUND right but WON'T WORK in practice
-> - Overly vague items that need specifics
-> - Ordering or dependency issues
->
-> For each finding:
-> - Cite the exact section/line
-> - Classify as CRITICAL, MAJOR, or MINOR
-> - Suggest a specific, actionable fix
->
-> If you can't explain why something won't work in plain language, it's probably fine. Only flag real problems.
+> ROUND MARKER (mandatory): After all fixes are applied and the document is complete, append the literal line `<!-- round-{N}-corrected -->` at the very end of the file as a machine-readable round tag.
 
-Write the output to `tmp/dc-5-critic2.md`.
-
----
-
-## Stage 6 — CORRECTOR-2
-
-Use the Agent tool with this prompt:
-
-> Final pass. Read:
-> - The corrected version at `tmp/dc-4-corrector1.md`
-> - The critique at `tmp/dc-5-critic2.md`
->
-> 1. Apply critique findings (same rules as before: fix valid ones, explain why you skip invalid ones)
-> 2. Verify internal consistency — do all sections agree with each other?
-> 3. Ensure every claim is justified and the structure is clean
->
-> Write the final version back to the original file at `$ARGUMENTS`.
->
-> Apply the self-review checklist from `references/self-review-checklist.md` after applying all fixes.
-> CRITICAL: For item 5 (evidence-gated verification), you MUST use the format
-> `VERIFIED: <thing> found at <file:line> — "<quoted evidence>"` or `UNVERIFIED: could not locate <thing>`.
-> Never claim "I verified X" without pasting the actual evidence.
-
-Also write a copy to `tmp/dc-6-final.md`.
+Write the output to `tmp/dc-{2*N+2}-corrector-round{N}.md`. This file becomes the "latest corrected doc" input for the next round's critic (or, on loop exit, the orchestrator copies it to `$ARGUMENTS` and `tmp/dc-final.md`).

@@ -48,6 +48,45 @@ gh auth status                # verify gh is authenticated
 - Store the current branch name for later decisions.
 - Capture `run_start_time` as the current ISO-8601 timestamp. Initialize an in-memory run record to accumulate metrics throughout the pipeline.
 
+## Stage 0.5 -- PLAN-REFRESH GATE (forge-harness only)
+
+**Applies only when `.forge/` directory exists in the repo root.** Non-forge repos skip this stage entirely. This gate ensures every PR in a forge-harness-style repo carries a plan-refresh signal indicating whether `forge_plan(documentTier: "update")` has been invoked against the current state. Enforced by Q0/L1 of the post-v0.20.1 execution plan (`.ai-workspace/plans/2026-04-12-next-execution-plan.md`).
+
+1. **Applicability check:** `test -d .forge` — if absent, record `planRefreshGate: "skipped-no-forge"` in the run record and skip to Stage 1.
+
+2. **Marker read (server-side, NEVER working tree — immune to shallow clones and `git clean`):**
+   ```bash
+   MSYS_NO_PATHCONV=1 git show origin/master:.forge/.plan-refresh-initialized 2>/dev/null
+   MARKER_EXIT=$?
+   ```
+   The `MSYS_NO_PATHCONV=1` prefix is required on Windows Git Bash (MSYS2), which otherwise mangles the `ref:path` colon into a semicolon and breaks the command. The env var has no effect on Linux/Mac. See issue #227.
+   - `MARKER_EXIT != 0` → marker absent on master → **bootstrap/empty-history case** → set `PLAN_REFRESH_LINE="plan-refresh: baseline"` and proceed. Record `planRefreshMarkerPresent: false`.
+   - `MARKER_EXIT == 0` → marker present on master → require an explicit non-`baseline` line (see step 3). Emit `baseline` is **forbidden** in this branch. Record `planRefreshMarkerPresent: true`.
+
+3. **Line value determination when marker is present:**
+   - If `$ARGUMENTS` contains a literal `plan-refresh:` token (e.g., `/ship plan-refresh: 3 items`), extract and use that line verbatim.
+   - Otherwise, check the current session for a recent `forge_plan(documentTier: "update")` invocation in the current working session — if present, derive the line from its outcome (`no-op` if the update produced zero rewrites, `<N> items` if it rewrote N items, `error: <reason>` if it errored).
+   - If neither source is available, **abort** with: `"Plan-refresh gate: no signal available. The marker .forge/.plan-refresh-initialized is present on origin/master, meaning forge_plan(update) has run at least once. Run forge_plan(documentTier: 'update') again in this session, or pass the line explicitly via '/ship plan-refresh: <form>'. Valid forms: no-op, <N> items, error: <reason>."`
+
+4. **Accepted line forms (exact literal match enforced in Stage 6):**
+   - `plan-refresh: no-op`
+   - `plan-refresh: <N> items` (where `<N>` is an integer ≥ 1)
+   - `plan-refresh: baseline` (only when marker is absent on master)
+   - `plan-refresh: error: <reason>` (requires `plan-refresh-override: <reason>`)
+   - `plan-refresh: error: halted-blocking-note:<noteId>` (added by Q0/L2 A1.2 amendment 2026-04-12; also requires override)
+
+5. **Error-form override handling:** if `PLAN_REFRESH_LINE` starts with `plan-refresh: error:`, the gate requires a matching `plan-refresh-override: <reason>` line in either `$ARGUMENTS` or the PR body. If `$ARGUMENTS` contains a literal `plan-refresh-override:` token, extract and set `PLAN_REFRESH_OVERRIDE_LINE` accordingly. If neither `$ARGUMENTS` nor any existing PR body contains the override line, **abort** with: `"Plan-refresh errored (<reason>). Merge is blocked by default. To proceed, supply 'plan-refresh-override: <reason>' via '/ship' arguments or add it to the PR body."`
+
+6. **Validation:** the computed `PLAN_REFRESH_LINE` must match the regex `^plan-refresh: (no-op|[1-9][0-9]* items|baseline|error: .+)$` — if not, abort with: `"Plan-refresh line malformed: '<value>'. Expected one of: 'plan-refresh: no-op', 'plan-refresh: <N> items' (N ≥ 1), 'plan-refresh: baseline', 'plan-refresh: error: <reason>'."` Note: `0 items` is deliberately rejected — use `no-op` for the zero case. See issue #217 (n=2 graduation).
+
+7. **Store** `PLAN_REFRESH_LINE` (and `PLAN_REFRESH_OVERRIDE_LINE` if applicable) for use in Stage 3 (body composition) and Stage 6 (pre-merge re-verification).
+
+8. **Record** in the run record:
+   - `planRefreshGate: "passed"` (or `"skipped-no-forge"` per step 1, or `"aborted-no-signal"` / `"aborted-missing-override"` / `"aborted-malformed"` on the respective abort paths)
+   - `planRefreshLine: "<value>"`
+   - `planRefreshMarkerPresent: true|false`
+   - `planRefreshOverride: "<value or null>"`
+
 ## Stage 1 -- BRANCH
 
 **On master/main:** Analyze the diff to derive a branch name with a conventional prefix:
@@ -70,10 +109,31 @@ Create the branch: `git checkout -b {prefix}/{slug}`
 1. `git push -u origin {branch}`
 2. Check if a PR already exists:
    ```bash
-   gh pr view --json number,url 2>/dev/null
+   gh pr view --json number,url,body 2>/dev/null
    ```
-   - **Exists:** Log the URL, skip creation.
-   - **Does not exist:** Create via `gh pr create --title "..." --body "..."` with a summary and test plan.
+   - **Exists:** Log the URL. **Plan-refresh gate check (added by Q0/L1):** if Stage 0.5 ran (forge-harness repo) and `PLAN_REFRESH_LINE` is set, verify the existing body contains a line matching `^plan-refresh: (no-op|[1-9][0-9]* items|baseline|error: .+)$`. If absent, append `PLAN_REFRESH_LINE` (and `PLAN_REFRESH_OVERRIDE_LINE` if set) to the body. Compose the new body with real newlines via `printf` (bash double-quoted `\n` is literal backslash-n and produces a broken body — see issue #218):
+     ```bash
+     if [ -n "$PLAN_REFRESH_OVERRIDE_LINE" ]; then
+       NEW_BODY=$(printf '%s\n\n---\n%s\n%s' "$EXISTING_BODY" "$PLAN_REFRESH_LINE" "$PLAN_REFRESH_OVERRIDE_LINE")
+     else
+       NEW_BODY=$(printf '%s\n\n---\n%s' "$EXISTING_BODY" "$PLAN_REFRESH_LINE")
+     fi
+     gh pr edit {pr-number} --body "$NEW_BODY"
+     ```
+     Record `planRefreshLineInjected: true`. If the line is already present, skip the edit and record `planRefreshLineInjected: false`.
+   - **Does not exist:** Create via `gh pr create --title "..." --body "..."` with a summary and test plan. **Plan-refresh gate check (added by Q0/L1):** if Stage 0.5 ran, the PR body MUST include `PLAN_REFRESH_LINE` as a trailer line (after the summary and test plan), separated from the rest of the body by a `---` horizontal rule. If `PLAN_REFRESH_OVERRIDE_LINE` is set, include it on the line immediately after `PLAN_REFRESH_LINE`. Body template:
+     ```
+     ## Summary
+     ...
+
+     ## Test plan
+     ...
+
+     ---
+     {PLAN_REFRESH_LINE}
+     [{PLAN_REFRESH_OVERRIDE_LINE if set}]
+     ```
+     Record `planRefreshLineEmbedded: true` in the run record.
 3. Store the PR number for subsequent stages.
 
 ## Stage 4 -- CI WAIT
@@ -133,6 +193,27 @@ Read `tmp/ship-review-{N}.md` and act on the verdict:
    - Otherwise: re-enter Stage 5 (next iteration).
 
 ## Stage 6 -- MERGE
+
+**Pre-merge plan-refresh re-verification (added by Q0/L1) — applies only when Stage 0.5 ran (forge-harness repo):**
+
+1. Re-fetch the live PR body to catch any manual edits that happened between Stage 3 and Stage 6:
+   ```bash
+   BODY=$(gh pr view {pr-number} --json body -q .body)
+   ```
+2. **Assert a valid plan-refresh line is present:**
+   ```bash
+   echo "$BODY" | grep -qE '^plan-refresh: (no-op|[1-9][0-9]* items|baseline|error: .+)$'
+   ```
+   If the grep returns non-zero, **abort** with: `"Merge blocked: PR body missing valid plan-refresh line. Expected one of: 'plan-refresh: no-op', 'plan-refresh: <N> items', 'plan-refresh: baseline', or 'plan-refresh: error: <reason>'. Re-run /ship or add the line manually via 'gh pr edit {pr-number} --body'."`
+3. **Error-form override enforcement:** if the plan-refresh line starts with `plan-refresh: error:`, additionally assert the override line is present:
+   ```bash
+   echo "$BODY" | grep -qE '^plan-refresh-override: .+$'
+   ```
+   If the grep returns non-zero, **abort** with: `"Merge blocked: plan-refresh reported an error ('<reason>') and merge is blocked by default. To proceed, add 'plan-refresh-override: <reason>' to the PR body via 'gh pr edit {pr-number} --body'."`
+4. **Baseline sanity check:** if the plan-refresh line is `plan-refresh: baseline`, re-verify the marker is still absent on master via `MSYS_NO_PATHCONV=1 git show origin/master:.forge/.plan-refresh-initialized 2>/dev/null` (the `MSYS_NO_PATHCONV=1` prefix is required on Windows Git Bash — see issue #227). If the command now exits zero (marker was committed between Stage 0.5 and Stage 6 by a concurrent merge), **abort** with: `"Merge blocked: plan-refresh line is 'baseline' but the .forge/.plan-refresh-initialized marker is now present on origin/master. Re-run /ship to recompute the plan-refresh signal against the current master state."`
+5. Record `planRefreshMergeGate: "passed"` in the run record.
+
+**Merge:**
 
 ```bash
 gh pr merge {pr-number} --squash --delete-branch

@@ -13,13 +13,14 @@ Use the Agent tool with this prompt:
 > **Why this stage exists:**
 > Imagine 6 people pass a drawing around a table. Each person adds or fixes something. At the end, you have a much better drawing — but you don't know WHO made it better. Was it the person who added color? The one who fixed proportions? The one who erased a mistake? This stage watches the replay to figure that out. Without it, we keep running all 6 stages forever, even if some contribute nothing. This is how the pipeline learns about itself.
 >
-> Read all 6 stage artifacts:
+> Read these artifacts only (the pipeline now runs a variable-length Critic/Corrector loop, so middle rounds are summarized via a count table rather than read in full):
 > - `tmp/dc-1-researcher.md` (Researcher — checked knowledge base for relevant patterns + justification analysis + built document inventory)
 > - `tmp/dc-2-drafter.md` (Drafter — improved the document based on research + justification)
-> - `tmp/dc-3-critic1.md` (Critic-1 — cold review, found problems in the draft)
-> - `tmp/dc-4-corrector1.md` (Corrector-1 — fixed problems Critic-1 found)
-> - `tmp/dc-5-critic2.md` (Critic-2 — cold review of the corrected version, found NEW problems)
-> - `tmp/dc-6-final.md` (Corrector-2 — fixed problems Critic-2 found, produced final version)
+> - `tmp/dc-3-critic-round1.md` (first round's critic, full text — cold review of the draft)
+> - `tmp/dc-4-corrector-round1.md` (first round's corrector, full text — fixed what round 1 flagged as blocking)
+> - The **final round** critic and corrector files (full text). These will be named `tmp/dc-{2*N+1}-critic-round{N}.md` and `tmp/dc-{2*N+2}-corrector-round{N}.md` where `N = roundsRun` from `tmp/dc-loop-state.json`.
+> - `tmp/dc-loop-state.json` — contains the per-round count table (`per_round` array) that is **authoritative** for all middle rounds. Do NOT attempt to read `tmp/dc-*-critic-round*.md` or `tmp/dc-*-corrector-round*.md` files for middle rounds — the count table is authoritative for those rounds.
+> - The original document at `$ARGUMENTS`.
 >
 > Also read the Critique Log at the end of `$ARGUMENTS`.
 >
@@ -29,9 +30,11 @@ Use the Agent tool with this prompt:
 > 3. **Did it introduce any problems?** (Fixing one thing can break another. Like patching a hole in a boat but accidentally blocking the drain.)
 > 4. **One-sentence verdict:** Was this stage worth its cost for this document?
 >
-> **Regression tracking:** For Drafter and Corrector-1, explicitly count how many NEW defects each introduced (not present in the input, present in the output). These are "regressions." Report as:
+> **Regression tracking:** For Drafter and each corrector round whose full text you read (round 1 + final round), explicitly count how many NEW defects each introduced (not present in the input, present in the output). These are "regressions." For middle rounds, regressions are inferred from the per-round count table: if `blocker_count[round N] > blocker_count[round N-1]`, that is a signal of a middle-round regression that the subsequent critic round caught — report it as an inferred regression with the round number. Report as:
 > - `drafter_regressions: N` (defects in dc-2-drafter.md not present in source document)
-> - `corrector1_regressions: N` (defects in dc-4-corrector1.md not present in dc-2-drafter.md)
+> - `corrector_round1_regressions: N` (defects in the round-1 corrector output not present in dc-2-drafter.md)
+> - `corrector_round{final}_regressions: N` (defects in the final corrector output not present in its input)
+> - `inferred_middle_round_regressions: [{round: N, delta: +X}, ...]` (from the count table)
 >
 > **Evidence-gating audit:** Check whether Drafter and Corrector-1 used the evidence-gated self-review format (`VERIFIED: <evidence>` or `UNVERIFIED`). Report:
 > - How many verification claims used evidence format vs. bare "I verified" claims
@@ -76,14 +79,25 @@ Use the Agent tool with this prompt:
 > ## This Run
 > - Document critiqued: [name and path]
 > - Content type: [prose-only | includes-TCs | code-heavy] — classify based on whether the document contains test cases/assertions (includes-TCs), executable code blocks (code-heavy), or neither (prose-only). This field tracks correlation between document type and Drafter regression count.
-> - Total findings: [N] (CRITICAL/MAJOR/MINOR breakdown)
-> - Application rate: [N]% (applied / total actionable — this tells us if findings are useful or just noise)
+> - Total findings: [N] (CRITICAL/MAJOR/MINOR breakdown, summed across all rounds)
+> - Application rate: [N]% (blocking findings applied / total blocking findings — this tells us if findings are useful or just noise)
 > - Drafter regressions: [N] (new defects introduced by Drafter)
-> - Corrector-1 regressions: [N] (new defects introduced by Corrector-1)
+> - Corrector regressions by round: round-1 [N], final-round [N], inferred middle rounds [list]
 > - Evidence-gating compliance: [N]% (verification claims with evidence / total verification claims)
 > - False verification claims: [N] (claimed VERIFIED but evidence wrong or missing)
 > - Novelty-flag compliance: [N]% (NEW_CLAIM tags / (tags + unflagged novel claims caught by critics))
-> - Stages that carried weight vs. stages that added nothing
+>
+> ## Loop Stats (new)
+> Read `tmp/dc-loop-state.json` and report:
+> - `rounds_run`: N
+> - `exit_reason`: clean | oscillation | max_rounds
+> - Per-round blocker table:
+>   | Round | blocker_count | critical | major | minor | novel | unverified |
+> - First-round blockers vs last-round blockers: did the loop converge?
+>
+> Cross-run loop stats (carry forward across prior effectiveness reports that contain Loop Stats sections):
+> | Run | rounds_run | exit_reason | round_1_blockers | round_N_blockers | total_findings_applied |
+> Trend: "rounds_run over last 10 runs" — if median is ≥3, the loop is doing real work. If median is 1–2, documents were already clean OR the `blocks_ship` flag is being under-applied (check against round-1 blocker counts from pre-loop runs to distinguish).
 >
 > ## Cross-Run Trends
 > (Compare this run to ALL previous runs. If this is the first run with feedback loop, compare against the results reports from earlier manual runs.)

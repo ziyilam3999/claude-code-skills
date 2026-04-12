@@ -56,6 +56,29 @@ Noted: {count}
 - {one-line description of each fix}
 ```
 
+**Escalation rule:** If `critical >= 1` OR `major >= 3`, print the banner block below **above** the `## Coherent Plan Review` summary, so it lands before the summary in terminal scrollback and cannot be buried. Then print the summary as usual. Also print the numbered `Options after escalation` block below immediately after the banner.
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ESCALATED — coherent-plan threshold exceeded
+  {critical} critical, {major} major blocking-class findings
+  Recommended next step: /double-critique {path}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Options after escalation:
+  1. Run `/double-critique {path}` — deeper multi-round critique loop (recommended when the plan is complex or high-stakes).
+  2. Fix the flagged issues yourself, then rerun `/coherent-plan {path}` — cheapest path when the findings are actionable and small.
+  3. Ignore and ship as-is — only valid for low-stakes plans where you judge remaining findings as acceptable.
+  4. Split the plan — extract the complex section into its own file, coherent-plan the simpler remainder, double-critique the complex extract.
+  5. Reduce scope, rerun `/coherent-plan` — trim what the plan is trying to do until findings drop below threshold.
+
+STATUS: ESCALATED
+```
+
+The final `STATUS: ESCALATED` sentinel is a machine-readable signal for any downstream automation. When the threshold is not crossed, omit the banner, options block, and sentinel entirely — no `STATUS: OK` line is printed, because absence is the default.
+
+Also persist `"escalated": true|false` in the `runs/data.json` entry for this run (next section). The threshold is intentionally lightweight — coherent-plan never loops, and never attempts to emulate double-critique. It only flags when a plan has outgrown coherent-plan's single-pass scope.
+
 ## Run Data Recording
 
 After the review completes (or errors out), persist run data. This section always runs.
@@ -78,6 +101,7 @@ Append to `runs/data.json` (create with `{"skill":"coherent-plan","lastRun":null
   "minor": "{N minor}",
   "fixed": "{N fixes applied}",
   "noted": "{N noted but not fixed}",
+  "escalated": "{true if critical >= 1 or major >= 3, else false}",
   "summary": "{one-line: e.g., 'plan.md, 5 findings (1 critical, 2 major, 2 minor), 4 fixed'}"
 }
 ```
@@ -89,9 +113,16 @@ Append to `runs/data.json` (create with `{"skill":"coherent-plan","lastRun":null
 
 Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
-Append one line to `runs/run.log` (keep last 100 lines):
+Append one line to `runs/run.log` (keep last 100 lines). When `escalated == true`, append the literal token ` | ESCALATED` at the end of the line so historical escalations are greppable via `grep ESCALATED skills/coherent-plan/runs/run.log`. When `escalated == false`, do not add any escalation marker (absence is the default).
+
+Non-escalated line format:
 ```
 {timestamp} | {outcome} | {project} | {critical}C/{major}M/{minor}m | {fixed} fixed | {summary}
+```
+
+Escalated line format:
+```
+{timestamp} | {outcome} | {project} | {critical}C/{major}M/{minor}m | {fixed} fixed | {summary} | ESCALATED
 ```
 
 Do not fail the skill if recording fails — log a warning and continue.

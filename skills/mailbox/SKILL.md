@@ -19,11 +19,22 @@ Claude Code sessions cannot communicate directly. This skill uses a shared git
 repository as a bulletin board. One session writes a message, the other pulls and
 reads it. Works across local CLI terminals AND Dispatch (cloud) sessions.
 
-## Discover Mailbox Repo
+## Execution Flow
 
-Before any mailbox operation, determine the mailbox repo path (`MAILBOX_REPO`).
+On every `/mailbox` invocation, check which mode to use:
 
-**Important:** Always re-run this discovery on each `/mailbox` invocation. Do NOT cache or memorize the mailbox repo path from a previous call -- the configuration may have changed.
+1. **If you have a MAILBOX CACHE memorized** from a previous `/mailbox` call in this conversation → use the **Warm Path** (skip to Subcommands directly)
+2. **Otherwise** → run **Cold Start** first, then proceed to Subcommands
+
+---
+
+## Cold Start
+
+**Runs once per conversation** — on the very first `/mailbox` invocation. All subsequent invocations use the Warm Path.
+
+### Step 1: Discover Mailbox Repo
+
+Determine the mailbox repo path (`MAILBOX_REPO`):
 
 1. If env var `MAILBOX_REPO` is set, use it
 2. Else if `~/.mailbox-repo` file exists, read its contents (an absolute path)
@@ -40,11 +51,18 @@ Before any mailbox operation, determine the mailbox repo path (`MAILBOX_REPO`).
 
 All paths below are relative to `{MAILBOX_REPO}`.
 
-## Setup: Agent Name
+### Step 2: Detect Default Branch
 
-On every `/mailbox` invocation, resolve the agent name using session-scoped identity:
+```bash
+cd {MAILBOX_REPO}
+DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}' || echo "main")
+```
 
-### Step 1: Read session ID
+### Step 3: Resolve Agent Name
+
+Resolve the agent name using session-scoped identity.
+
+#### 3a: Read session ID
 
 Session IDs are delivered to each session privately via the `SessionStart`
 hook (`inject-session-id.sh`), which injects a line of the form
@@ -54,7 +72,7 @@ terminals running in the same project directory.
 
 Priority order:
 
-1. **If a `MAILBOX_SESSION_ID=...` line appeared in this session's SessionStart context, use that value.** It is authoritative and session-private. Memorize it: "My session ID is {id}" — use it for ALL subsequent `/mailbox` calls in this conversation.
+1. **If a `MAILBOX_SESSION_ID=...` line appeared in this session's SessionStart context, use that value.** It is authoritative and session-private.
 2. Else if you already memorized a session ID earlier in this conversation, use it.
 3. Else (legacy fallback — SessionStart hook did not run, e.g. older Claude Code, or Windows terminal that skipped the hook): list files in `.ai-workspace/sessions/` of the **current project root** and pick the most recently modified filename as the session ID. **Warn the user**: "⚠ SessionStart hook did not deliver MAILBOX_SESSION_ID; falling back to most-recent sessions/ file. If you have multiple terminals open in the same project, identities may collide — restart terminals to pick up the hook."
 4. Else set session ID to `"default"`.
@@ -63,14 +81,14 @@ Do not re-read any shared singleton file like `.current-session-id`. That
 path was removed because it was a last-writer-wins collision point between
 terminals sharing a project directory.
 
-### Step 2: Read agent registry
+#### 3b: Read agent registry
 
 Read `{MAILBOX_REPO}/.ai-workspace/.mailbox-agents.json`.
 - If it exists, parse it as JSON: `{ "<session-id>": "<agent-name>", ... }`
 - If it does not exist, start with an empty registry `{}`
 - **Important:** Always read/write the registry from `{MAILBOX_REPO}`, never from the current project root (unless CWD *is* the mailbox repo). If `.ai-workspace/.mailbox-agents.json` exists in CWD but CWD ≠ MAILBOX_REPO, ignore it — it is stale.
 
-### Step 3: Resolve name
+#### 3c: Resolve name
 
 **Important:** Only use the sources listed below to determine the agent name. Do NOT use project memory, auto-memory files, or context from prior conversations. Agent names are session-scoped and must come from: (1) the user, initial prompt, or project CLAUDE.md saying "Your name is X" or "Your mailbox name is X", (2) the registry entry for THIS session ID, or (3) fresh generation.
 
@@ -90,11 +108,10 @@ Read `{MAILBOX_REPO}/.ai-workspace/.mailbox-agents.json`.
    - Before writing, check if this name already exists as a value in the registry under a different session ID. If so, generate a different name (try up to 3 times).
    - Read the existing registry, add the new entry keyed by session ID, write back the full registry (preserving all other entries)
 6. Print: `Agent name: {name}. Run /rename {name} to label this terminal tab.`
-7. Remember this name for the rest of the conversation
 
 **Safety check:** When writing to the registry, ONLY write/update the key matching YOUR memorized session ID. Never modify entries for other session IDs.
 
-### Registry maintenance
+#### Registry maintenance
 
 When writing to the registry, if it has more than 20 entries, keep only the 20 most recent
 (by position in the JSON object -- newer entries are appended at the end).
@@ -103,6 +120,37 @@ Names are **persisted per-session** in the registry. This means:
 - The name survives `/compact` and `--continue`/`--resume` (same session ID).
 - Different sessions on the same project get **independent names**.
 - To change your name, say "Your name is X".
+
+### Step 4: Memorize Cache
+
+After completing steps 1-3, memorize the following as your **MAILBOX CACHE**:
+
+```
+MAILBOX CACHE:
+  repo: {MAILBOX_REPO}
+  session_id: {session ID}
+  agent_name: {resolved name}
+  default_branch: {DEFAULT_BRANCH}
+  known_agents: {}
+```
+
+This cache persists for the rest of the conversation. All subsequent `/mailbox` calls use it directly.
+
+Now proceed to the relevant Subcommand below.
+
+---
+
+## Warm Path
+
+**Used for all `/mailbox` invocations after the first.** You already have a MAILBOX CACHE memorized.
+
+Use the cached `repo`, `session_id`, `agent_name`, and `default_branch` directly — no discovery, no registry reads, no branch detection.
+
+For transport mode: check `known_agents` in the cache (see Transport Mode Detection below). If the agent is cached and `checked_at` < 30 min ago, use the cached mode. Otherwise run transport detection once and update the cache.
+
+Proceed directly to the relevant Subcommand.
+
+---
 
 ## Reserved Aliases
 
@@ -133,10 +181,18 @@ When creating triggers via `RemoteTrigger create`, always include this directive
 
 ## Transport Mode Detection
 
-Before each send/check/handoff operation, determine whether to use **local mode**
-(skip git push/pull) or **git mode** (full push/pull cycle).
+Determines whether to use **local mode** (skip git push/pull) or **git mode** (full push/pull).
+
+**Caching:** After detecting transport mode for any agent, update `known_agents` in the MAILBOX CACHE:
+```
+known_agents:
+  {agent-name}: { transport: local|git, checked_at: {current timestamp} }
+```
+On subsequent calls, if the agent is in `known_agents` and `checked_at` < 30 min ago, use the cached transport mode without re-running detection.
 
 ### For send / handoff operations
+
+Determine transport mode for the **recipient**:
 
 1. If the recipient is `dispatch` or `all`: use **git mode** (stop here)
 2. Reverse-lookup: scan `{MAILBOX_REPO}/.ai-workspace/.mailbox-agents.json` for
@@ -153,18 +209,22 @@ Before each send/check/handoff operation, determine whether to use **local mode*
 
 ### For check operations
 
+**Pull decision:**
 1. Run a lightweight remote check:
    ```
    cd {MAILBOX_REPO}
-   DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || git remote show origin 2>/dev/null | grep 'HEAD branch' | awk '{print $NF}' || echo "main")
    git fetch origin "$DEFAULT_BRANCH" 2>/dev/null
    BEHIND=$(git rev-list "HEAD..origin/$DEFAULT_BRANCH" --count 2>/dev/null || echo "1")
    ```
-2. **Pull step:** If BEHIND > 0 or the fetch failed → **git mode** (pull needed).
+2. If BEHIND > 0 or the fetch failed → **git mode** (pull needed).
    If BEHIND = 0 → **local mode** (skip pull).
-3. **Push step (after processing):** If any processed message's `from:` agent does NOT
-   map to a recent local session (same reverse-lookup as send) → **git mode** (push needed).
-   If all messages were from local agents, or no messages → **local mode** (skip push).
+
+**Push decision (after processing):**
+3. For each processed message, determine transport mode for the **sender** (`from:` field):
+   - Check `known_agents` cache first (if cached and < 30 min old, use it)
+   - Otherwise, run the same reverse-lookup + session-file-age check as send operations, then cache the result
+4. If any sender is remote (git mode) or unknown → **git mode** (push needed).
+   If all senders are local, or no messages → **local mode** (skip push).
 
 ### Fallback
 
@@ -172,6 +232,17 @@ If any detection step fails (command errors, missing files, parse failures),
 default to **git mode**. It is always safe to *attempt* push/pull; if push
 fails (e.g., archived remote, network error), warn and continue — the message
 is committed locally. It is never safe to skip when uncertain.
+
+### Cache Invalidation
+
+| Cached Value | When to Invalidate |
+|-------------|-------------------|
+| `repo`, `session_id`, `agent_name`, `default_branch` | Never — constant within a conversation |
+| `known_agents[X].transport` | Re-check if `checked_at` > 30 min ago |
+| `known_agents[X].transport` | Re-check if git push/pull fails for that agent |
+| Entire MAILBOX CACHE | Clear on unexpected git error; re-run Cold Start |
+
+Safety property: falling back to Cold Start is always correct. The cache is purely an optimization.
 
 ### Push Failure Recovery
 
@@ -182,16 +253,17 @@ After any `git push` failure in git mode:
 
 ## Subcommands
 
+All subcommands below assume the MAILBOX CACHE is populated (either by Cold Start or from a previous invocation). Use cached `repo`, `agent_name`, and `default_branch` directly.
+
 ### `/mailbox send` or `/mailbox send to <agent-name>`
 
 Write and deliver a message.
 
-1. Resolve agent name (setup above)
-2. Determine recipient:
+1. Determine recipient:
    - If user specified `to <name>`: use that name
    - If user said "send to X": use X
    - Otherwise: ask "Who should this be addressed to?"
-3. Determine message content:
+2. Determine message content:
    - If user provided content inline: use it
    - Otherwise: compose using the checklist below
 
@@ -217,14 +289,15 @@ Write and deliver a message.
    - "As discussed" / "as mentioned" → never reference prior conversation; inline all context
    - Vague status without counts → use mechanical clarity: "3/5 tests pass", "PASS", "12 files"
    - Sending a status without metrics when metrics exist in your conversation
-4. Write message file to `{MAILBOX_REPO}/mailbox/inbox/`:
+3. Run Transport Mode Detection for the recipient (check `known_agents` cache first).
+4. Write message file to `{repo}/mailbox/inbox/`:
 
    **Filename:** `{YYYY-MM-DDTHHMM}-{from}-to-{to}-{subject-slug}.md`
 
    **Format:**
    ```markdown
    ---
-   from: {agent-name}
+   from: {agent_name}
    from_project: {current project directory name}
    to: {recipient-name}
    to_project: {recipient project, if known, else "unknown"}
@@ -236,26 +309,16 @@ Write and deliver a message.
    {message body -- use the compose checklist above; receiver has zero context}
    ```
 
-5. Run Transport Mode Detection (send). Then git operations in the mailbox repo:
+5. Git operations — **batch into a single command**:
 
    **Git mode:**
-   ```
-   cd {MAILBOX_REPO}
-   DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
-   git checkout "$DEFAULT_BRANCH"
-   git pull --rebase
-   git add mailbox/inbox/{filename}
-   git commit -m "mailbox: {from} -> {to}: {subject}"
-   git push 2>&1 || echo "⚠ Push failed — message committed locally but Dispatch sessions may not see it."
+   ```bash
+   cd {repo} && git checkout {default_branch} && git pull --rebase && git add mailbox/inbox/{filename} && git commit -m "mailbox: {from} -> {to}: {subject}" && git push 2>&1 || echo "⚠ Push failed — message committed locally but Dispatch sessions may not see it."
    ```
 
    **Local mode:**
-   ```
-   cd {MAILBOX_REPO}
-   DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
-   git checkout "$DEFAULT_BRANCH"
-   git add mailbox/inbox/{filename}
-   git commit -m "mailbox: {from} -> {to}: {subject}"
+   ```bash
+   cd {repo} && git checkout {default_branch} && git add mailbox/inbox/{filename} && git commit -m "mailbox: {from} -> {to}: {subject}"
    ```
 
 6. Print: `Message sent to {to} ({mode}). Tell that session to run /mailbox check.`
@@ -265,58 +328,50 @@ Write and deliver a message.
 
 Read and archive incoming messages.
 
-1. Resolve agent name (setup above)
-2. Run Transport Mode Detection (check). Then ensure mailbox repo is on the default branch:
+1. Run Transport Mode Detection for check (pull decision):
 
    **Git mode (upstream has changes):**
-   ```
-   cd {MAILBOX_REPO}
-   DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
-   git checkout "$DEFAULT_BRANCH"
-   git pull --rebase
+   ```bash
+   cd {repo} && git checkout {default_branch} && git pull --rebase
    ```
 
    **Local mode (no upstream changes):**
-   ```
-   cd {MAILBOX_REPO}
-   DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|refs/remotes/origin/||' || echo "main")
-   git checkout "$DEFAULT_BRANCH"
+   ```bash
+   cd {repo} && git checkout {default_branch}
    ```
 
-3. List all files in `{MAILBOX_REPO}/mailbox/inbox/`
-4. For each `.md` file, read the frontmatter:
+2. List all files in `{repo}/mailbox/inbox/`
+3. For each `.md` file, read the frontmatter:
    - If `to:` matches this agent's name OR `to: all`: this message is for us
    - If this is a Dispatch session: also match `to: dispatch`
    - Skip messages where `to:` doesn't match
-5. For each matching message:
+4. For each matching message:
    a. Print the subject, sender, timestamp, and body
    b. If the message has a `type: handoff` field, also print all `handoff:` fields (repo, branch, pr, task_status, what_done, what_left, files_changed, resume_plan)
    c. Update `status: unread` to `status: read` in the file
    d. **Archive (REQUIRED):** `git mv mailbox/inbox/{file} mailbox/archive/{file}`
-6. Git operations (always commit locally; push only in git mode):
+5. Run Transport Mode Detection for each sender (`from:` field) — check `known_agents` cache first, run detection only for unknown/stale senders. This determines the push decision.
+6. Git operations — **batch into a single command**:
+   ```bash
+   cd {repo} && git add mailbox/ && git commit -m "mailbox: {agent_name} read {N} message(s)"
    ```
-   cd {MAILBOX_REPO}
-   git add mailbox/
-   git commit -m "mailbox: {agent-name} read {N} message(s)"
-   ```
-   **Git mode only** (any processed message was from a non-local agent):
-   ```
+   **Git mode only** (any sender is remote or unknown):
+   ```bash
    git push 2>&1 || echo "⚠ Push failed — archive committed locally but remote sync failed."
    ```
 7. **Verify archive:** Confirm no processed messages remain in `mailbox/inbox/` for this agent. If any do, run `git mv` now, then `git add mailbox/ && git commit -m "mailbox: archive missed files"`. Only run `git push` if in git mode.
-8. If no messages found: print `No new messages for {agent-name}.`
+8. If no messages found: print `No new messages for {agent_name}.`
 
 ### `/mailbox status`
 
 Show agent identity and unread count.
 
-1. Resolve agent name (setup above)
-2. Count files in `{MAILBOX_REPO}/mailbox/inbox/` where `to:` matches this agent's name (and `dispatch`/`all` if applicable)
-3. Print:
+1. Count files in `{repo}/mailbox/inbox/` where `to:` matches this agent's name (and `dispatch`/`all` if applicable)
+2. Print:
    ```
-   Agent: {name}
+   Agent: {agent_name}
    Project: {current project}
-   Mailbox repo: {MAILBOX_REPO}
+   Mailbox repo: {repo}
    Unread: {count} message(s)
    ```
 
@@ -324,13 +379,12 @@ Show agent identity and unread count.
 
 Write a structured handoff message for session-to-session work transfer.
 
-1. Resolve agent name (setup above)
-2. Determine recipient (same as `/mailbox send`)
-3. Compose a handoff message with structured fields:
+1. Determine recipient (same as `/mailbox send`)
+2. Compose a handoff message with structured fields:
 
    ```markdown
    ---
-   from: {agent-name}
+   from: {agent_name}
    from_project: {current project directory name}
    to: {recipient-name}
    to_project: {recipient project, if known, else "unknown"}
@@ -358,8 +412,8 @@ Write a structured handoff message for session-to-session work transfer.
    {detailed prose context -- everything the receiving agent needs to continue the work}
    ```
 
-4. Run Transport Mode Detection (send) and git operations (same as `/mailbox send` step 5)
-5. Print: `Handoff sent to {to} ({mode}). They can run /mailbox check to pick up the work.`
+3. Run Transport Mode Detection for the recipient (check `known_agents` cache first) and git operations (same as `/mailbox send` step 5)
+4. Print: `Handoff sent to {to} ({mode}). They can run /mailbox check to pick up the work.`
    where `{mode}` is `local` or `git`.
 
 ## Important Rules
@@ -392,10 +446,11 @@ Append to `runs/data.json` (create with `{"skill":"mailbox","lastRun":null,"tota
     "messagesRead": 0,
     "agentsRegistered": 0,
     "subcommandsUsed": ["{subcommand1}", "{subcommand2}"],
-    "transportMode": "local|git"
+    "transportMode": "local|git",
+    "executionPath": "cold|warm"
   },
   "issues": [],
-  "summary": "{one-line: e.g., 'sent 1 message to brave-alice (git mode)'}"
+  "summary": "{one-line: e.g., 'sent 1 message to brave-alice (git mode, warm)'}"
 }
 ```
 
@@ -408,7 +463,7 @@ Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and incr
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```
-{timestamp} | {outcome} | {agent} | {messagesSent}s/{messagesRead}r/{agentsRegistered}reg | {summary}
+{timestamp} | {outcome} | {agent} | {messagesSent}s/{messagesRead}r/{agentsRegistered}reg | {executionPath} | {summary}
 ```
 
 Do not fail the skill if recording fails — log a warning and continue.
