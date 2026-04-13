@@ -304,10 +304,26 @@ Write and deliver a message.
    subject: {brief subject line}
    timestamp: {ISO-8601}
    status: unread
+   # --- optional reply/threading fields (all default-omitted) ---
+   reply_expected: false          # true if you expect a reply
+   reply_sla_seconds: null        # defaults by priority when reply_expected=true: blocker=600, normal=1500, fyi=null
+   reply_to: {filename-of-prior-mail}  # when this mail is itself a reply
+   thread_id: {slug}              # groups related mails; defaults to subject-slug on thread start
+   priority: normal               # blocker | normal | fyi
+   auto_schedule_wakeup: false    # see Phase 3.2 in plan; requires reply_expected=true + non-null SLA
    ---
 
    {message body -- use the compose checklist above; receiver has zero context}
    ```
+
+   **Send-time validation** (reject before writing the file):
+   - `reply_expected: false` AND non-null `reply_sla_seconds` → reject: `reply_sla_seconds only valid when reply_expected: true`.
+   - `priority: fyi` AND `reply_expected: true` → reject: `fyi priority cannot require a reply`.
+   - `auto_schedule_wakeup: true` AND `reply_expected: false` → reject: `auto_schedule_wakeup requires reply_expected: true`.
+   - `auto_schedule_wakeup: true` AND null `reply_sla_seconds` (after priority-default resolution) → reject: `auto_schedule_wakeup requires a non-null reply_sla_seconds`.
+   - `priority` not in `{blocker, normal, fyi}` → reject: `priority must be one of: blocker, normal, fyi`.
+
+   **SLA defaults** (applied only when `reply_expected: true` and `reply_sla_seconds` is null): `blocker=600`, `normal=1500`, `fyi=null`. Source: swift-henry's 2026-04-13 comm-schedule protocol lock.
 
 5. Git operations — **batch into a single command**:
 
@@ -321,8 +337,17 @@ Write and deliver a message.
    cd {repo} && git checkout {default_branch} && git add mailbox/inbox/{filename} && git commit -m "mailbox: {from} -> {to}: {subject}"
    ```
 
-6. Print: `Message sent to {to} ({mode}). Tell that session to run /mailbox check.`
-   where `{mode}` is `local` or `git`.
+6. **Auto-schedule wake-up (if `auto_schedule_wakeup: true`):** run the procedure in "Wait-for-reply infrastructure" below, passing the message's `subject-slug`, `to:` (as `expected_sender`), effective `reply_sla_seconds`, and a default `max_retries = 2`.
+7. Print:
+   ```
+   Message sent to {to} ({mode}). Tell that session to run /mailbox check.
+   Retract via /mailbox retract {subject-slug} until recipient archives it.
+   ```
+   where `{mode}` is `local` or `git` and `{subject-slug}` is the canonical slug used in the filename. If auto-wakeup was scheduled, append:
+   ```
+   Auto-wakeup scheduled for {fire_at_iso} (cron {cron_id}).
+   Note: cron fires only when Claude is idle. If Claude exits before fire time, the wake-up is lost — run /mailbox check --resume-wait {subject-slug} manually on next startup.
+   ```
 
 ### `/mailbox check`
 
@@ -350,6 +375,11 @@ Read and archive incoming messages.
    b. If the message has a `type: handoff` field, also print all `handoff:` fields (repo, branch, pr, task_status, what_done, what_left, files_changed, resume_plan)
    c. Update `status: unread` to `status: read` in the file
    d. **Archive (REQUIRED):** `git mv mailbox/inbox/{file} mailbox/archive/{file}`
+   e. **Append read receipt** to `{repo}/.ai-workspace/read-receipts.jsonl` (gitignored) via atomic append (open O_APPEND on POSIX, or temp-file-rotation on Windows if append is unsafe):
+      ```json
+      {"timestamp": "{ISO-8601-now}", "reader": "{agent_name}", "sender": "{from}", "filename": "{file}", "subject": "{subject}"}
+      ```
+      Rotation: if `read-receipts.jsonl` has > 1000 lines after append, trim to the newest 500 lines.
 5. Run Transport Mode Detection for each sender (`from:` field) — check `known_agents` cache first, run detection only for unknown/stale senders. This determines the push decision.
 6. Git operations — **batch into a single command**:
    ```bash
@@ -360,20 +390,205 @@ Read and archive incoming messages.
    git push 2>&1 || echo "⚠ Push failed — archive committed locally but remote sync failed."
    ```
 7. **Verify archive:** Confirm no processed messages remain in `mailbox/inbox/` for this agent. If any do, run `git mv` now, then `git add mailbox/ && git commit -m "mailbox: archive missed files"`. Only run `git push` if in git mode.
-8. If no messages found: print `No new messages for {agent_name}.`
+8. **Pending-replies GC:** for every file in `{repo}/.ai-workspace/pending-replies/*.json`, compute `sent_at + (max_retries + 1 + 3) * sla_seconds + 3600s`. If that timestamp is in the past, delete the watcher file (and `CronDelete(cron_id)` if `cron_id != null`, ignoring errors). The `+3` term bounds worst-case extension from early-fire absorptions (budget=3).
+9. If no messages found: print `No new messages for {agent_name}.`
 
 ### `/mailbox status`
 
-Show agent identity and unread count.
+Show agent identity, unread count, polling mechanics, and co-located agents.
 
-1. Count files in `{repo}/mailbox/inbox/` where `to:` matches this agent's name (and `dispatch`/`all` if applicable)
-2. Print:
+1. Count files in `{repo}/mailbox/inbox/` where `to:` matches this agent's name (and `dispatch`/`all` if applicable).
+2. **Cron introspection (Polling mechanics):**
+   a. Run `ToolSearch select:CronCreate,CronList,CronDelete` first — without this, `CronList` raises `InputValidationError`.
+   b. Call `CronList`. Parse each line: `{id} — {schedule} ({mode}) [{persistence}]: {prompt}`.
+   c. Filter to lines whose prompt substring-contains the literal token `/mailbox check` (not just `/mailbox`).
+   d. For each match print:
+      ```
+      Polling mechanics:
+        Cron: {id} — {schedule} [{persistence}]
+        Mode: {recurring|one-shot}
+        Prompt: {prompt}
+      ```
+   e. If zero matches: `⚠ No scheduled /mailbox check cron detected. Replies to this agent may have unbounded latency.`
+   f. On `InputValidationError`: `⚠ Cron introspection unavailable ({error}). Ensure ToolSearch has loaded CronList.` Then continue — do not abort `/mailbox status`.
+3. **Co-location probe:** enumerate every entry in `{repo}/.ai-workspace/.mailbox-agents.json`. For each `(session-id, agent-name)` pair where `agent-name != self`, check whether `{repo}/.ai-workspace/sessions/{session-id}` was modified within the last `MAILBOX_SESSION_TTL` minutes (env var, default `120`). Collect the set of co-located agent names (dedupe — multiple session IDs may map to the same name). If registry is missing or malformed, emit `⚠ Co-location probe unavailable (registry missing/malformed)` and continue.
+   - If the co-located set is non-empty, print:
+     ```
+     Co-located with: {agent1}, {agent2}
+       ⚠ Shared failure domain — heartbeats between co-located agents NOT recommended.
+     ```
+4. **Read-receipt cursor counter:** per-agent cursor file `{repo}/.ai-workspace/read-receipts-cursor/{agent_name}.txt` stores a single integer = last-seen line number in `read-receipts.jsonl`.
+   a. Read cursor (default `0` if file absent).
+   b. Count current total lines in `{repo}/.ai-workspace/read-receipts.jsonl` (0 if file absent).
+   c. **Rotation guard:** if cursor > current line count, reset cursor to `0` and read from line 1 (rotation trim happened since last status call).
+   d. Read lines `cursor+1 .. EOF` and count entries where `sender == {agent_name}`. Call that `N`.
+   e. Write the new EOF line number to the cursor file via atomic temp-then-rename.
+5. Print:
    ```
    Agent: {agent_name}
    Project: {current project}
    Mailbox repo: {repo}
    Unread: {count} message(s)
+   Recent read receipts: {N} of your mails were read since last status check.
    ```
+
+### `/mailbox retract <slug>`
+
+Withdraw a mail you sent, as long as the recipient has not yet archived it. The retraction is best-effort: if the recipient pulls and archives before your retract reaches their branch, the mail is already delivered and cannot be un-sent.
+
+1. **Resolve slug → file (double-anchored):**
+   a. Glob `{repo}/mailbox/inbox/*-to-*-{slug}.md` as a candidate pool.
+   b. For each candidate, read frontmatter and compute the canonical subject-slug by slugifying the `subject:` field with the same slugifier `/mailbox send` uses (lowercase, non-alnum → `-`, collapse runs).
+   c. Retain only candidates whose canonical subject-slug is **exactly equal** to the provided `{slug}` — not a suffix match. This prevents `foo` from matching a mail with subject-slug `bar-foo`.
+   d. If the glob returned zero candidates, scan all `{repo}/mailbox/inbox/*.md` frontmatter and apply the same exact-equality filter.
+   e. Multiple matches → abort, print disambiguation listing (filename + timestamp + from → to).
+   f. Zero matches → abort: `No inbox mail from {agent_name} with subject-slug {slug}.`
+2. Verify frontmatter `from:` equals `{agent_name}`. Else refuse: `Cannot retract: {filename} was sent by {from}, not you.`
+3. Verify file path is under `mailbox/inbox/` not `mailbox/archive/`. Else refuse: `Cannot retract: {filename} is already archived.`
+4. **Race-close (pre-commit fetch):** determine recipient transport mode from the mail's `to:` field. If git mode:
+   ```bash
+   cd {repo} && git fetch origin {default_branch}
+   ```
+   Then check whether the file still exists at `inbox/{file}` on `origin/{default_branch}`:
+   ```bash
+   git cat-file -e origin/{default_branch}:mailbox/inbox/{file} 2>/dev/null
+   ```
+   If it does NOT exist on origin (recipient already archived), abort: `⚠ Retract lost the race — {to} already pulled and archived {filename}. Send a correction mail instead.`
+   If local mode, skip the fetch.
+5. **Snapshot rollback target:** `PRE_RETRACT=$(git rev-parse HEAD)`.
+6. `git rm mailbox/inbox/{file}`.
+7. Append a JSONL record to `{repo}/.ai-workspace/retractions.log` (gitignored). Fields: `{timestamp, agent, filename, to, subject, outcome}`. Rotate: if line count > 1000, trim to the newest 500 lines.
+8. Commit: `git commit -m "mailbox: {agent_name} retracted {filename}"` and record `RETRACT_COMMIT=$(git rev-parse HEAD)`.
+9. **Git mode only — push, with non-destructive rollback on failure:**
+   ```bash
+   git push 2>&1
+   ```
+   If push fails:
+   a. `git pull --rebase`.
+   b. Inspect result. Three sub-cases:
+      - **(i) Clean rebase, file still absent on new HEAD and no recipient archive commit landed** (just stale remote): the rebase left the retract commit correctly layered on top of the latest remote — retry `git push`. If push fails again, re-enter step 9's failure path (up to 3 total attempts with `git pull --rebase` between each). After 3 failed attempts, abort and instruct the user to resolve manually. **Do NOT revert** — a clean rebase means the retract is still valid; `git revert {RETRACT_COMMIT}` would forward-recreate `inbox/{file}` and push it, defeating the entire retraction command.
+      - **(ii) Rebase pulled in a recipient archive commit** (file moved to `archive/{file}` on origin): the recipient already saw it. Retraction is moot. **Do NOT revert** — the revert would be empty against the merged tree. Leave `RETRACT_COMMIT` in local history as a no-op on merge. Update the retractions.log entry's `outcome` to `"lost-race-recipient-archived"`. Print:
+        ```
+        ⚠ Retract lost the race: recipient {to} archived {filename} at {archive-commit-sha}.
+        The retract commit on your local branch is now meaningless. Leaving it in place
+        (recipient's archive takes precedence on merge). Send a correction mail instead.
+        ```
+      - **(iii) Rebase conflict unrelated to a recipient archive:** abort, leave the working tree in the conflict state, instruct the user to resolve manually.
+   c. **Never `git reset --hard`** — it discards unrelated local commits.
+10. On happy path and sub-case (i), print:
+    ```
+    Retracted. Recipient will never see it ({mode}).
+    ```
+    Sub-case (ii) prints the lost-race banner in step 9(b)(ii) instead.
+
+### `/mailbox sent`
+
+List mail you have sent (newest first, capped at 100).
+
+1. Enumerate `{repo}/mailbox/inbox/*.md` and `{repo}/mailbox/archive/*.md`. Filenames begin with an ISO timestamp, so sort descending by filename — chronological without parsing frontmatter.
+2. Walk the sorted list; for each file:
+   a. Read frontmatter. On parse failure, skip the file and continue.
+   b. If `from:` != `{agent_name}`, skip.
+   c. If the file is under `inbox/`, format as `[unread]`. If under `archive/`, lookup archive time via `git log -1 --format=%cI -- mailbox/archive/{file}` and format as `[read at {archive-commit-time}]`.
+   d. Print:
+      ```
+      [unread] {timestamp} → {to}: {subject}  ({filename})
+      [read at {archive-commit-time}] {timestamp} → {to}: {subject}  ({filename})
+      ```
+   e. Stop after 100 printed lines. If the list was truncated, append `(older entries omitted — 100-item cap)`.
+3. If zero matches: `No mail sent by {agent_name}.`
+
+### `/mailbox thread <thread_id>`
+
+Reconstruct and print an entire threaded conversation in chronological order.
+
+1. Enumerate `{repo}/mailbox/inbox/*.md` + `{repo}/mailbox/archive/*.md`.
+2. For each file, read frontmatter. On parse failure, skip silently. Keep files whose `thread_id:` equals `{thread_id}`.
+3. Sort the kept files by frontmatter `timestamp:` ascending.
+4. Build a `reply_to` chain map: for each mail, its parent is the mail whose filename equals its `reply_to:` field (if any). Compute indent depth = chain length from root.
+5. For each mail, print:
+   ```
+   {indent}{timestamp} {from} → {to} [{priority}]: {subject}
+   {indent}  ({filename})
+   {indent}  {body-first-line-or-80-chars}
+   ```
+   where `{indent}` is two spaces per depth level.
+6. If zero matches: `No mail found in thread {thread_id}.`
+
+### Wait-for-reply infrastructure
+
+Shared procedure used by `auto_schedule_wakeup: true` at send time, by `/mailbox wait-for-reply`, and by the re-arm path in `/mailbox check --resume-wait`. Watcher files live at `{repo}/.ai-workspace/pending-replies/{slug}.json` (gitignored). One file per slug; filename IS the canonical slug.
+
+**Schema:**
+```json
+{
+  "slug": "example-slug",
+  "waiter_agent": "forge-plan",
+  "expected_sender": "swift-henry",
+  "sent_at": "2026-04-13T12:45:00+08:00",
+  "max_retries": 2,
+  "retries_used": 0,
+  "early_fire_absorptions": 0,
+  "sla_seconds": 1500,
+  "cron_id": "20e3f83e",
+  "scheduling_mode": "cron-pinned"
+}
+```
+`cron_id` MAY be `null` iff `scheduling_mode == "passive-year-boundary"`.
+
+**Step 0 — Precondition:** `ToolSearch select:CronCreate,CronList,CronDelete` loaded. Else abort: `⚠ Cannot schedule wake-up: cron tools not loaded.`
+
+**Step 1 — Compute `fire_at`:**
+- Base: `fire_at = now + sla_seconds + 95`. The 95 s pad is **load-bearing** — the probe has observed one-shot jobs firing up to 90 s early; the pad guarantees that even an early fire lands past the true SLA deadline.
+- Hint (non-load-bearing): round `fire_at` forward to the next minute whose minute field is neither `00` nor `30`. If that next minute also hits `00`/`30`, add one more minute. This reduces jitter observed on boundary minutes; correctness does not depend on it.
+
+**Step 2 — Year-boundary check (passive fallback):**
+- If `fire_at.year != now.year`, the cron 5-field expression cannot pin a year. Fall back to passive mode:
+  - Do NOT call `CronCreate`.
+  - Write the watcher file with `scheduling_mode: "passive-year-boundary"`, `cron_id: null`.
+  - Print: `⚠ auto_schedule_wakeup cannot cross a year boundary with the current cron-expression mechanism. Reply watcher is passive — /mailbox check --resume-wait {slug} will still detect the reply on manual invocation, but no wake-up will fire.`
+  - Skip steps 3–4.
+
+**Step 3 — Two-phase write (cron first, watcher second):**
+a. Call `CronCreate(cron="{M} {H} {DoM} {Mon} *", prompt="/mailbox check --resume-wait {slug}", recurring=false)`. Do NOT pass `durable: true` — the Phase 1 probe showed it is silently downgraded to session-only. Capture returned `cron_id`.
+b. Only after `cron_id` is known, write `{repo}/.ai-workspace/pending-replies/{slug}.json` via atomic temp-then-rename (`{slug}.json.tmp` → `{slug}.json`) with the schema above.
+c. If (a) fails: do not touch the pending-replies directory. Surface the error and abort.
+d. If (b) fails after (a) succeeded: call `CronDelete(cron_id)` to remove the orphaned cron. If `CronDelete` also fails, log both errors and rely on `/mailbox check --resume-wait` step 1's "missing watcher → stale fire, warn and return" path to absorb the orphan on fire.
+
+**Step 4 — Return** `cron_id` and `fire_at` to the caller.
+
+### `/mailbox check --resume-wait <slug>`
+
+Variant of `/mailbox check` invoked by the scheduled cron (or manually) to process a pending reply.
+
+1. Read `{repo}/.ai-workspace/pending-replies/{slug}.json`. Missing → stale fire: `⚠ No pending-reply watcher for {slug} (already resolved or GC'd).` Return.
+2. Run `/mailbox check` normally (pull, archive, commit). Collect the list of mails processed in this check.
+3. **Reply detection — ALL three conditions required** for a processed mail to count as a reply to this watcher:
+   - Mail's `from:` equals watcher's `expected_sender`, AND
+   - Mail's `reply_to:` equals `{slug}` OR mail's `thread_id:` equals `{slug}`, AND
+   - Mail's `timestamp:` is strictly after watcher's `sent_at`.
+4. **Reply found:** delete the watcher file; call `CronDelete(cron_id)` if `cron_id != null` (no-op if already fired); print `Reply to {slug} received.` Done.
+5. **No reply found — branch on timing:**
+   - **(a) Early fire** (`now < sent_at + sla_seconds`): check `early_fire_absorptions`.
+     - If `>= 3`: budget exhausted, fall through to path (b) below (charges a retry).
+     - Otherwise: increment `early_fire_absorptions`; compute `remaining = (sent_at + sla_seconds) - now`; set `fire_at = now + max(remaining + 95, 120)`; apply step 1's `:00/:30` avoidance; re-issue `CronCreate` (recurring=false); update the watcher's `cron_id` and `early_fire_absorptions` via the two-phase write (cron first, then watcher update). On `CronCreate` failure, leave watcher as-is, surface error, and let the next `/mailbox check` GC path handle it. Log `early-fire absorbed ({early_fire_absorptions}/3)`. Return.
+   - **(b) SLA elapsed** (`now >= sent_at + sla_seconds`): increment `retries_used`. If `retries_used >= max_retries`, delete watcher file and print `⚠ No reply to {slug} after {max_retries} attempts over ~{max_retries * sla_seconds}s. Escalating to human.` Else compute `fire_at = now + sla_seconds` (apply step 1 pad + rounding), re-issue `CronCreate`, update watcher via two-phase write.
+6. Commit any archives normally per `/mailbox check` step 6.
+
+**Garbage collection (runs on every `/mailbox check`, not just `--resume-wait`):** delete any watcher file whose `sent_at + (max_retries + 1 + 3) * sla_seconds + 3600s` is in the past. The `+3` term bounds the worst-case extension from early-fire absorptions (budget of 3). Passive-year-boundary watchers are GC'd by the same rule.
+
+### `/mailbox wait-for-reply <slug> [--max-retries N] [--interval-seconds S]`
+
+For agents who forgot `auto_schedule_wakeup: true` at send time, or want to add a watcher to a mail already sent.
+
+1. Resolve `{slug}` to a file using the same double-anchored resolver as `/mailbox retract` (glob candidate pool + frontmatter exact-equality on canonical subject-slug). Search both `inbox/` and `archive/`. If zero / multiple, abort with disambiguation.
+2. From the resolved mail's frontmatter: set `expected_sender = to:`, `sent_at = timestamp:`.
+3. Parse CLI flags:
+   - `--max-retries N`: clamp to `[1, 10]`. Default `2`.
+   - `--interval-seconds S`: default to the effective `reply_sla_seconds` of the resolved mail (after priority-default resolution), or `1500` if the mail has none.
+4. **Compute first `fire_at = now + interval_seconds`** — NOT `sent_at + interval_seconds`. The user may be invoking `wait-for-reply` late (past `sent_at + interval`); `sent_at`-based computation could produce a past timestamp, and past-timestamp one-shot semantics are undefined. `now + interval_seconds` guarantees a future fire time.
+5. Run the "Wait-for-reply infrastructure" procedure from Step 1 onward with `sla_seconds = interval_seconds`, `max_retries = N`. The same 95 s pad + `:00/:30` avoidance + year-boundary fallback apply.
+6. Print: `Watcher armed for {slug}. Wake-up at {fire_at_iso} (cron {cron_id}). Max retries: {N}.` Or the passive-mode banner from Step 2 of the infrastructure procedure.
 
 ### `/mailbox handoff to <agent-name>`
 
@@ -424,6 +639,16 @@ Write a structured handoff message for session-to-session work transfer.
 - If the mailbox repo has uncommitted changes unrelated to mailbox, only stage mailbox files.
 - If git push fails in git mode (e.g., needs pull first), run `git pull --rebase` then retry push.
 - **Never persist agent names to memory.** Do not save your own or others' mailbox agent names to Claude Code memory files. Names are session-scoped — the registry is the sole persistence mechanism. Memory entries will become stale and mislead future sessions.
+
+## Protocol Safety Rules
+
+These rules prevent agents from reasoning about their own infrastructure from memory instead of querying it — the root cause of the 2026-04-13 T1320/T1430/T1445 retraction incident.
+
+1. **One-shot crons only for wait-for-reply.** Every `CronCreate` used to wake a waiting agent must use `recurring: false` with a pinned future minute/hour/DoM/month. Never use `*/5` or any recurring pattern — recurring crons burn retry budget against the same deadline.
+2. **Bounded retries.** After `max_retries` one-shot fires with no reply, escalate to a human. Never re-arm indefinitely.
+3. **No heartbeats between co-located agents.** Agents sharing the same filesystem share a failure domain — a heartbeat between them proves nothing about the network and only adds noise.
+4. **Verify polling before expecting a reply.** Before sending mail that expects a reply, run `/mailbox status` and confirm a `/mailbox check` cron is listed under Polling mechanics. If none exists, the reply latency is unbounded.
+5. **Probe tools before claiming their behavior.** Before asserting anything about your own tools (cron semantics, tool-search behavior, scheduling windows), run `ToolSearch` to load the schema and invoke the tool itself. Do not reason from memorized schemas or prior-conversation state — tool surfaces change, and memory goes stale.
 
 ## Run Data Recording
 
