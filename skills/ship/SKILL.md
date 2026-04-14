@@ -192,6 +192,57 @@ Read `tmp/ship-review-{N}.md` and act on the verdict:
    - If counter >= 5: print remaining bugs and escalate to user. **Do NOT merge.**
    - Otherwise: re-enter Stage 5 (next iteration).
 
+## Stage 5.5 -- CAIRN INDEX-CHECK GATE (Phase B, client-side only)
+
+**This is a Tier-2 client-side gate, not a hard branch-protection required check.** UI merges and admin overrides bypass it by design; the monthly audit (M7) is the retroactive signal. Do not describe this as a merge-required check anywhere.
+
+Applies to any PR whose diff touches:
+- `hive-mind-persist/knowledge-base/**/*.md`
+- `hive-mind-persist/memory.md`
+- `hive-mind-persist/session-notes/**/*.md`
+
+Steps:
+
+1. **Gated-path detection:**
+   ```bash
+   CHANGED=$(gh pr view {pr-number} --json files -q '.files[].path')
+   GATED=0
+   for f in $CHANGED; do
+     case "$f" in
+       hive-mind-persist/knowledge-base/*.md|hive-mind-persist/memory.md|hive-mind-persist/session-notes/*.md)
+         GATED=1; break;;
+     esac
+   done
+   ```
+   If `GATED=0`, print `[SHIP] index-check gate: no gated paths — skipping` and proceed. No prompt.
+
+2. **Re-fetch PR body** (catch manual UI edits since Stage 3):
+   ```bash
+   gh pr view {pr-number} --json body -q .body > .ai-workspace/ship-pr-body-{pr-number}.txt
+   ```
+   Do NOT write the body back to the remote after reading — the gate is read-only.
+
+3. **Validate via the cairn Phase B checker:**
+   ```bash
+   node cairn/bin/phase-b-checks.mjs ship-gate \
+     --pr-body-file .ai-workspace/ship-pr-body-{pr-number}.txt --gated
+   ```
+   The checker strips CRLF, rejects blockquoted `> index-check:` lines, and accepts exactly one of:
+   - `index-check: P<N>[, F<M>, ...]` (IDs, comma separated, optional spaces)
+   - `index-check: none`
+   - `index-check: skip -- <non-empty reason>` (ASCII `--`, not em-dash)
+
+4. **On non-zero exit:** abort with:
+   ```
+   Merge blocked: PR body missing a valid index-check: trailer. See parent-claude.md
+   "Cairn Index-Check Trailer" section. Valid forms:
+     index-check: P46, F36
+     index-check: none
+     index-check: skip -- <reason>
+   ```
+
+5. Record `cairnIndexCheckGate: "passed"|"skipped-no-gated"|"aborted-invalid"` in the run record.
+
 ## Stage 6 -- MERGE
 
 **Pre-merge plan-refresh re-verification (added by Q0/L1) — applies only when Stage 0.5 ran (forge-harness repo):**
