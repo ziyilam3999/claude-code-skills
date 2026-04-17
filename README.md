@@ -1,10 +1,22 @@
 # Claude Code Skills
 
+[![License](https://img.shields.io/github/license/ziyilam3999/claude-code-skills)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/ziyilam3999/claude-code-skills)](https://github.com/ziyilam3999/claude-code-skills/releases)
+[![Claude Code](https://img.shields.io/badge/built%20for-Claude%20Code-purple)](https://docs.anthropic.com/en/docs/claude-code)
+
 A collection of custom skills for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), Anthropic's CLI for Claude. These skills extend Claude Code with specialized workflows for shipping code, reviewing documents, managing sessions, and more.
 
 ## What are Claude Code Skills?
 
 Skills are markdown files that teach Claude Code new capabilities. When installed, they appear as slash commands (e.g., `/ship`, `/checkpoint`) or auto-load to improve Claude's behavior in specific contexts.
+
+```mermaid
+graph LR
+    R[claude-code-skills repo] -->|setup.sh symlinks| H[~/.claude/skills/]
+    H -->|/ship invoked| CC[Claude Code]
+    CC -->|reads SKILL.md| S[ship skill<br/>10-stage pipeline]
+    H -.auto-load.-> CC
+```
 
 ## Skill Catalog
 
