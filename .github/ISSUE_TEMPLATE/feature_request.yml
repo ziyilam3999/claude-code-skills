@@ -1,0 +1,41 @@
+name: Feature Request
+description: Suggest a new skill or a change to an existing skill
+labels: [enhancement]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - New skill (propose a new slash command or auto-loaded behavior)
+        - Change to existing skill
+        - Documentation / catalog change
+    validations:
+      required: true
+  - type: input
+    id: skill-name
+    attributes:
+      label: Skill name (for existing-skill changes)
+      placeholder: e.g. ship, checkpoint
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: What workflow is missing or painful today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed behavior
+      description: What should the skill do? (Example invocation + expected Claude response welcome.)
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
