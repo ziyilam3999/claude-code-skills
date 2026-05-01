@@ -19,6 +19,33 @@ Claude Code sessions cannot communicate directly. This skill uses a shared git
 repository as a bulletin board. One session writes a message, the other pulls and
 reads it. Works across local CLI terminals AND Dispatch (cloud) sessions.
 
+## Subcommand Quick Reference
+
+The three hot-path subcommands (`send`, `check`, `status`) cover 100% of typical use,
+but several edge-case subcommands exist and are worth knowing about — they surface
+rarely in everyday flow but are load-bearing when you need them. Added as a
+discoverability aid during the 2026-04-15 `/skill-evolve improve` pass after analysis
+showed users exercise only 3 of 10 available subcommands.
+
+**Hot path (daily use):**
+| Command | When |
+|---|---|
+| `/mailbox send [to <name>]` | Write and deliver a message to another agent |
+| `/mailbox check` | Read and archive any messages addressed to you |
+| `/mailbox status` | Show your agent identity, unread count, and polling mechanics |
+
+**Edge-case / advanced (know they exist for when you need them):**
+| Command | When |
+|---|---|
+| `/mailbox handoff to <name>` | Structured session-to-session work transfer (includes branch, PR, task state) |
+| `/mailbox sent` | List mail you have sent (last 100, newest first) |
+| `/mailbox thread <thread_id>` | Reconstruct an entire threaded conversation in chronological order — audit trail for decision-making |
+| `/mailbox retract <slug>` | Withdraw a mail you sent BEFORE the recipient archives it (race-close protected) |
+| `/mailbox wait-for-reply <slug>` | Arm a one-shot reply watcher with cron-pinned wake-up on a mail already sent |
+| `/mailbox check --resume-wait <slug>` | Reply-detection variant invoked by the scheduled wake-up (manual fallback when a cron fires early or Claude exited) |
+
+If you forgot `auto_schedule_wakeup: true` at send time, `/mailbox wait-for-reply` is the recovery path. If you want to audit a multi-round decision trail, `/mailbox thread` reconstructs it. These are the "insurance" subcommands.
+
 ## Execution Flow
 
 On every `/mailbox` invocation, check which mode to use:
@@ -304,7 +331,7 @@ Write and deliver a message.
    subject: {brief subject line}
    timestamp: {ISO-8601}
    status: unread
-   # --- optional reply/threading fields (all default-omitted) ---
+   # --- optional reply/threading fields (omit any fields you do not need; shown for reference) ---
    reply_expected: false          # true if you expect a reply
    reply_sla_seconds: null        # defaults by priority when reply_expected=true: blocker=600, normal=1500, fyi=null
    reply_to: {filename-of-prior-mail}  # when this mail is itself a reply
@@ -375,7 +402,7 @@ Read and archive incoming messages.
    b. If the message has a `type: handoff` field, also print all `handoff:` fields (repo, branch, pr, task_status, what_done, what_left, files_changed, resume_plan)
    c. Update `status: unread` to `status: read` in the file
    d. **Archive (REQUIRED):** `git mv mailbox/inbox/{file} mailbox/archive/{file}`
-   e. **Append read receipt** to `{repo}/.ai-workspace/read-receipts.jsonl` (gitignored) via atomic append (open O_APPEND on POSIX, or temp-file-rotation on Windows if append is unsafe):
+   e. **Append read receipt** to `{repo}/.ai-workspace/read-receipts.jsonl` (gitignored) via a single `fs.appendFile` call per record (`O_APPEND`; single-writer in practice, so no concurrent-write concern):
       ```json
       {"timestamp": "{ISO-8601-now}", "reader": "{agent_name}", "sender": "{from}", "filename": "{file}", "subject": "{subject}"}
       ```
@@ -445,7 +472,7 @@ Withdraw a mail you sent, as long as the recipient has not yet archived it. The 
    f. Zero matches → abort: `No inbox mail from {agent_name} with subject-slug {slug}.`
 2. Verify frontmatter `from:` equals `{agent_name}`. Else refuse: `Cannot retract: {filename} was sent by {from}, not you.`
 3. Verify file path is under `mailbox/inbox/` not `mailbox/archive/`. Else refuse: `Cannot retract: {filename} is already archived.`
-4. **Race-close (pre-commit fetch):** determine recipient transport mode from the mail's `to:` field. If git mode:
+4. **Race-close (pre-commit fetch):** determine recipient transport mode from the mail's `to:` field using the same detection logic as send operations (see "For send / handoff operations" under Transport Mode Detection — `auto_schedule_wakeup: true` alone does not determine transport; session liveness and recipient type also factor in). If git mode:
    ```bash
    cd {repo} && git fetch origin {default_branch}
    ```
@@ -455,18 +482,17 @@ Withdraw a mail you sent, as long as the recipient has not yet archived it. The 
    ```
    If it does NOT exist on origin (recipient already archived), abort: `⚠ Retract lost the race — {to} already pulled and archived {filename}. Send a correction mail instead.`
    If local mode, skip the fetch.
-5. **Snapshot rollback target:** `PRE_RETRACT=$(git rev-parse HEAD)`.
-6. `git rm mailbox/inbox/{file}`.
-7. Append a JSONL record to `{repo}/.ai-workspace/retractions.log` (gitignored). Fields: `{timestamp, agent, filename, to, subject, outcome}`. Rotate: if line count > 1000, trim to the newest 500 lines.
-8. Commit: `git commit -m "mailbox: {agent_name} retracted {filename}"` and record `RETRACT_COMMIT=$(git rev-parse HEAD)`.
-9. **Git mode only — push, with non-destructive rollback on failure:**
+5. `git rm mailbox/inbox/{file}`.
+6. Append a JSONL record to `{repo}/.ai-workspace/retractions.log` (gitignored). Fields: `{timestamp, agent, filename, to, subject, outcome}`. Rotate: if line count > 1000, trim to the newest 500 lines.
+7. Commit: `git commit -m "mailbox: {agent_name} retracted {filename}"` and record `RETRACT_COMMIT=$(git rev-parse HEAD)`.
+8. **Git mode only — push, with non-destructive rollback on failure:**
    ```bash
    git push 2>&1
    ```
    If push fails:
    a. `git pull --rebase`.
    b. Inspect result. Three sub-cases:
-      - **(i) Clean rebase, file still absent on new HEAD and no recipient archive commit landed** (just stale remote): the rebase left the retract commit correctly layered on top of the latest remote — retry `git push`. If push fails again, re-enter step 9's failure path (up to 3 total attempts with `git pull --rebase` between each). After 3 failed attempts, abort and instruct the user to resolve manually. **Do NOT revert** — a clean rebase means the retract is still valid; `git revert {RETRACT_COMMIT}` would forward-recreate `inbox/{file}` and push it, defeating the entire retraction command.
+      - **(i) Clean rebase, file still absent on new HEAD and no recipient archive commit landed** (just stale remote): the rebase left the retract commit correctly layered on top of the latest remote — retry `git push`. If push fails again, re-enter step 8's failure path (up to 3 total attempts with `git pull --rebase` between each). After 3 failed attempts, abort and instruct the user to resolve manually. **Do NOT revert** — a clean rebase means the retract is still valid; `git revert {RETRACT_COMMIT}` would forward-recreate `inbox/{file}` and push it, defeating the entire retraction command.
       - **(ii) Rebase pulled in a recipient archive commit** (file moved to `archive/{file}` on origin): the recipient already saw it. Retraction is moot. **Do NOT revert** — the revert would be empty against the merged tree. Leave `RETRACT_COMMIT` in local history as a no-op on merge. Update the retractions.log entry's `outcome` to `"lost-race-recipient-archived"`. Print:
         ```
         ⚠ Retract lost the race: recipient {to} archived {filename} at {archive-commit-sha}.
@@ -475,11 +501,11 @@ Withdraw a mail you sent, as long as the recipient has not yet archived it. The 
         ```
       - **(iii) Rebase conflict unrelated to a recipient archive:** abort, leave the working tree in the conflict state, instruct the user to resolve manually.
    c. **Never `git reset --hard`** — it discards unrelated local commits.
-10. On happy path and sub-case (i), print:
+9. On happy path and sub-case (i), print:
     ```
     Retracted. Recipient will never see it ({mode}).
     ```
-    Sub-case (ii) prints the lost-race banner in step 9(b)(ii) instead.
+    Sub-case (ii) prints the lost-race banner in step 8(b)(ii) instead.
 
 ### `/mailbox sent`
 
@@ -510,7 +536,7 @@ Reconstruct and print an entire threaded conversation in chronological order.
    ```
    {indent}{timestamp} {from} → {to} [{priority}]: {subject}
    {indent}  ({filename})
-   {indent}  {body-first-line-or-80-chars}
+   {indent}  {first non-blank body line, truncated to 80 chars with … suffix if longer}
    ```
    where `{indent}` is two spaces per depth level.
 6. If zero matches: `No mail found in thread {thread_id}.`
@@ -684,7 +710,7 @@ Append to `runs/data.json` (create with `{"skill":"mailbox","lastRun":null,"tota
 - `no-action` — no messages to process or no action taken (e.g., `/mailbox check` with empty inbox)
 - `error` — skill could not complete (mailbox repo not found, git failure, etc.)
 
-Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
+Keep last 50 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```

@@ -26,11 +26,15 @@ Execute the full git shipping pipeline on the current working directory. If `$AR
 | 6 | Merge | Squash merge via gh | Merge conflict |
 | 7 | Release | Version bump, changelog, tag, GitHub Release | -- |
 | 8 | Cleanup | Switch to master, pull, delete branch | -- |
+| 9 | Record | Persist run data to `runs/data.json` and `runs/run.log` | -- |
+| 10 | Card | Emit working-memory decision card (success runs only) | -- |
 
 Print a status line before each stage:
 ```
-[SHIP {N}/8] {description}...
+[SHIP {N}/10] {description}...
 ```
+
+**Stage 9 is NOT optional.** Prior versions of this SKILL.md placed Run Data Recording as an appendix below the main stages, which made it structurally easy to skip — operators executing the pipeline manually would finish Stage 8 Cleanup, feel the work was done, and exit before reaching the recording. That silent-skip failure mode was caught by a 2026-04-15 `/skill-evolve improve` pass after three consecutive `/ship` invocations in one session left no `data.json` trace. Promoting recording to a numbered stage with its own `[SHIP 9/10]` status line makes the final step visible in the pipeline progression. The recording itself remains best-effort (do not fail the pipeline on recording errors — log a warning and continue) but the **decision to record** is now unconditional.
 
 ---
 
@@ -163,6 +167,8 @@ Record `ciWaitSeconds` as the elapsed time from the first poll to resolution.
 
 ## Stage 5 -- SELF-REVIEW LOOP
 
+**Release-PR short-circuit (runs first).** If this `/ship` invocation is operating on a release PR, skip the reviewer loop entirely. Detection: the PR title matches `^chore: release [0-9]` OR the PR body contains a `release-pr: true` trailer. Both signals are written by Stage 7 when it opens the release PR. On a match, log `releaseSelfReview: skipped: release-pr-detected`, write the standard PASS verification marker (`echo "{ISO-8601 timestamp}" > .ai-workspace/ship-verified-{pr-number}` — this is the *release PR's own number* returned by `gh pr create`, not the feature PR's; Stage 5's marker-write logic already keys on the active PR), record `cardEmission`/`reviewIterations` as 0, and proceed directly to Stage 6. Rationale: release PRs are mechanical version bumps; the feature PR's Stage 5 already vetted the substantive diff.
+
 Iterate up to **5 times**. Each iteration:
 
 ### 5a. Spawn Stateless Reviewer
@@ -274,21 +280,21 @@ If merge fails due to conflicts, report the conflicting files and **abort**. Do 
 
 ## Stage 7 -- RELEASE
 
-Inline version bump, changelog, tag, and GitHub Release. No external automation PRs.
+Version bump + changelog land on master via a **squash-merged release PR**, not a direct push. The release worktree mirrors Rule 12 worktree discipline used elsewhere in the pipeline. Tagging happens **after** the release PR merges so the tag points at the squash-merge commit on master.
 
 1. **Check if repo is releasable:** Look for `package.json` at the repo root.
-   - If not found: log "No package.json — skipping release." Proceed to Stage 8.
+   - If not found: log "No package.json -- skipping release." Proceed to Stage 8.
 
-2. **Get last tag:**
+2. **Get last tag (read-only on master):**
    ```bash
-   git checkout master && git pull
-   git describe --tags --abbrev=0 2>/dev/null
+   git fetch origin master --tags
+   git describe --tags --abbrev=0 origin/master 2>/dev/null
    ```
    - If no tags exist: use `0.0.0` as baseline, default bump = minor (→ `0.1.0`).
 
 3. **Collect commits since last tag:**
    ```bash
-   git log {last_tag}..HEAD --format="%s"
+   git log {last_tag}..origin/master --format="%s"
    ```
 
 4. **Determine version bump** from conventional commit prefixes:
@@ -299,38 +305,124 @@ Inline version bump, changelog, tag, and GitHub Release. No external automation 
 
 5. **Compute new version:** Increment the appropriate semver component of the last tag.
 
-6. **Update package.json:** Set `"version": "{new_version}"` using a targeted edit.
+6. **Create a fresh release worktree from `origin/master`:**
+   ```bash
+   git worktree add .claude/worktrees/release-{version} -b chore/release-{version} origin/master
+   cd .claude/worktrees/release-{version}
+   ```
+   This is the same Rule 12 pattern used everywhere else in the pipeline. Editing happens here, not in the primary clone.
 
-7. **Generate CHANGELOG entry:**
+7. **Inside the release worktree, bump `package.json`** to `"version": "{new_version}"` via a targeted edit. Do not touch other fields.
+
+8. **Inside the release worktree, generate CHANGELOG entry:**
    - Group commits by type: `### Features` (feat), `### Bug Fixes` (fix), `### Miscellaneous` (everything else)
    - Format: `## [{version}](https://github.com/{owner/repo}/compare/{last_tag}...v{version}) ({date})`
    - Prepend to `CHANGELOG.md` (create the file if missing).
 
-8. **Commit + tag + push:**
+9. **Sanity-check the diff before committing.** Run:
    ```bash
-   git add package.json CHANGELOG.md
-   git commit -m "chore: release {version}"
-   git tag v{version}
-   git push && git push --tags
+   git status --porcelain
+   git diff --shortstat
    ```
+   Only `package.json` and `CHANGELOG.md` should appear. If any other file shows up (notably a phantom whole-file reformat from CRLF/LF mismatch on Windows), halt with a clear error pointing at the line-ending mismatch — do **not** commit.
 
-9. **Create GitHub Release:**
-   ```bash
-   gh release create v{version} --title "v{version}" --notes "{changelog_entry}"
-   ```
+10. **Commit (no tag yet):**
+    ```bash
+    git add package.json CHANGELOG.md
+    git commit -m "chore: release {version}"
+    ```
+    Do not tag and do not attempt to publish to master from the worktree at this point.
 
-10. Log: `[SHIP] Released v{version} — tag, changelog, and GitHub Release created.`
-11. Record `releaseVersion: "{version}"` and `releaseBump: "major|minor|patch"` in the run record. If release was skipped (no package.json), record `releaseVersion: null` and `releaseBump: "skipped"`.
+11. **Push the release branch:**
+    ```bash
+    git push -u origin chore/release-{version}
+    ```
 
-**Important:** This stage is non-fatal. The feature PR is already merged. Any failure here should log a warning and continue to Stage 8, never abort.
+12. **Open the release PR.** The body's first line MUST contain a recognizable release-PR marker (`release-pr: true` trailer) so Stage 5 can short-circuit when this PR is the next one inspected:
+    ```bash
+    gh pr create --title "chore: release {version}" --body "$(printf '%s\n\n%s\n' 'release-pr: true' "$CHANGELOG_ENTRY")"
+    ```
+    Capture the returned PR number/URL into `RELEASE_PR_URL` and `RELEASE_PR_NUMBER` for Stage 9.
+
+13. **Merge the release PR.** Use auto-merge so GitHub waits for CI; the operator does not poll:
+    ```bash
+    gh pr merge {release-pr-number} --squash --auto --delete-branch
+    ```
+    If `--auto` is unsupported on the local `gh` version, fall back to the Stage 4 CI-wait pattern: poll `gh pr checks` every 30s for up to 10 minutes, then `gh pr merge {release-pr-number} --squash --delete-branch`. If branch protection requires a different merge mode (rebase or merge), adapt accordingly. If the release PR's CI fails, log the failure clearly and stop — leave the open PR for manual recovery; do not spawn a fixer (Stage 5 was already skipped for release PRs).
+
+14. **After the release PR merges, tag the squash-merge commit.** Fetch master, confirm HEAD is the squash-merge commit, then tag and push the single tag:
+    ```bash
+    cd "$PRIMARY_CLONE_OR_RELEASE_WORKTREE"
+    git fetch origin master
+    MERGE_SHA=$(gh pr view {release-pr-number} --json mergeCommit -q .mergeCommit.oid)
+    git tag v{version} "$MERGE_SHA"
+    git push origin v{version}
+    ```
+    If pushing the single tag is rejected (e.g., tag protection on the remote), log `release tag rejected by remote -- stopping; manual tag push needed before GitHub Release can be created` and stop. Do not attempt to bypass the rejection.
+
+15. **Create the GitHub Release:**
+    ```bash
+    gh release create v{version} --title "v{version}" --notes "{changelog_entry}"
+    ```
+
+16. Log: `[SHIP] Released v{version} via PR #{release-pr-number} -- tag, changelog, and GitHub Release created.`
+17. Record release fields in the run record. See Stage 9's schema for the field list (`releaseVersion`, `releaseBump`, `releaseViaPR`, `releasePrUrl`). When this stage skips because no `package.json` is present, record `releaseVersion: null`, `releaseBump: "skipped"`, `releaseViaPR: false`, `releasePrUrl: null`.
+
+**Important:** This stage is non-fatal. The feature PR is already merged. Any failure here should log a warning and continue to Stage 8, never abort. Stage 8 will quarantine the release worktree regardless of whether step 14/15 succeeded.
 
 ## Stage 8 -- CLEANUP
 
+Cleanup is **worktree-aware** because rule #12 ("always use a worktree for branched work in shared repos") routes most ai-brain ships through a secondary worktree. The legacy `git checkout master` path fails inside a secondary worktree with `fatal: 'master' is already used by worktree at <primary>` — master is already checked out by the shared clone — and the rest of the cleanup chain (delete branch, remove verification marker) gets skipped. Detect the worktree case once and branch.
+
 ```bash
-git checkout master && git pull
-git branch -d {branch} 2>/dev/null   # delete local if still exists
-rm -f .ai-workspace/ship-verified-{pr-number}   # clean up verification marker
+GIT_DIR=$(git rev-parse --git-dir)
+GIT_COMMON_DIR=$(git rev-parse --git-common-dir)
+
+if [ "$GIT_DIR" = "$GIT_COMMON_DIR" ]; then
+  # Primary clone — legacy path.
+  git checkout master && git pull
+  git branch -d {branch} 2>/dev/null   # delete local if still exists
+  rm -f .ai-workspace/ship-verified-{pr-number}   # clean up verification marker
+else
+  # Secondary worktree (rule #12 case). Pull in the shared clone, remove
+  # this worktree, delete the local branch, and prune the verification marker
+  # from the worktree before it's removed.
+  WORKTREE_PATH=$(pwd -P)
+  PRIMARY_PATH=$(cd "$GIT_COMMON_DIR/.." && pwd -P)
+  rm -f .ai-workspace/ship-verified-{pr-number}   # clean marker before worktree is removed
+  cd "$PRIMARY_PATH"
+  # Intentional per CLAUDE.md rule #12: do NOT `git checkout master` here.
+  # The shared primary clone may legitimately be on a non-master branch for
+  # other agents; we pull whatever branch it's on. A future maintainer might
+  # be tempted to add `git checkout master` for symmetry with the primary-
+  # clone path above — don't. That would yank HEAD out from under any
+  # concurrent agent working in the shared clone.
+  git pull
+  git worktree remove "$WORKTREE_PATH" 2>/dev/null \
+    || git worktree remove --force "$WORKTREE_PATH"
+  git branch -d {branch} 2>/dev/null   # delete local if still exists
+  # Remote branch was already deleted by `gh pr merge --delete-branch` in Stage 6.
+  # If it lingers (gh's local-branch deletion sometimes fails on Windows when
+  # HEAD-switching is blocked by a worktree), prune the dangling remote ref:
+  git push origin --delete {branch} 2>/dev/null || true
+fi
 ```
+
+**Release-worktree quarantine** (runs after the feature-worktree branch above when Stage 7 created a release worktree). The release worktree at `.claude/worktrees/release-{version}` is no longer needed once the release PR has merged and the tag has been pushed. Move it (do NOT `rm -rf` — Rule 14) into a quarantine path, then prune the worktree registry:
+
+```bash
+RELEASE_WT=".claude/worktrees/release-{version}"
+if [ -d "$RELEASE_WT" ]; then
+  # Operate from the primary clone so the worktree path is reachable.
+  cd "$PRIMARY_PATH"
+  QUARANTINE_DIR=".claude/worktrees/_quarantine-release-{version}-$(date +%Y%m%d)"
+  mv "$RELEASE_WT" "$QUARANTINE_DIR"
+  git worktree prune
+  git branch -d chore/release-{version} 2>/dev/null || true
+fi
+```
+
+The `mv`-not-`rm` step is mandatory per CLAUDE.md Rule 14 ("Always Use `mv`, Never `rm`"). The quarantine dir is a sibling under `.claude/worktrees/`, so a future operator can recover the release worktree if anything went wrong with the GitHub Release creation.
 
 **Auto-publish skills** (conditional): If `scripts/publish-skills.sh` exists in the repo root AND the merged PR touched files under `skills/`, run the publish script. Log the result but do not fail the pipeline if publishing fails. This only triggers in repos that have the publish script.
 
@@ -342,9 +434,11 @@ rm -f .ai-workspace/ship-verified-{pr-number}   # clean up verification marker
 
 ---
 
-## Run Data Recording (always runs)
+## Stage 9 -- RECORD (always runs)
 
-This section executes regardless of whether stages succeeded or failed. If the pipeline aborts at any stage, still record the run before stopping.
+Print the status line: `[SHIP 9/10] Recording run data...`
+
+This stage executes regardless of whether earlier stages succeeded or failed. If the pipeline aborts at any stage, Stage 9 still runs before stopping. This is the observability contract — every invocation MUST produce a run record, including aborted runs (a "nothing to ship" abort is still a run worth tracking because it reveals invocation patterns). Prior versions made this an appendix-style "Run Data Recording (always runs)" section which was structurally easy to skip; it is now an explicit numbered stage.
 
 ### What to record
 
@@ -366,7 +460,8 @@ Build the run record from metrics accumulated throughout the pipeline:
     "selfReview": "pass|fail|skip",
     "merge": "pass|fail|skip",
     "release": "pass|fail|skip",
-    "cleanup": "pass|fail|skip"
+    "cleanup": "pass|fail|skip",
+    "card": "pass|fail|skip"
   },
   "metrics": {
     "prUrl": "{PR URL or null}",
@@ -383,7 +478,10 @@ Build the run record from metrics accumulated throughout the pipeline:
     "ciRetryOutcome": "pass|fail|timeout|null",
     "releaseVersion": "{version or null}",
     "releaseBump": "major|minor|patch|skipped|null",
-    "commitCount": "{number of commits: initial + fix iterations}"
+    "releaseViaPR": "{true if Stage 7 used the PR-merge flow; false if Stage 7 was skipped because no package.json; null if Stage 7 errored before deciding}",
+    "releasePrUrl": "{URL of the release PR, or null if no release}",
+    "commitCount": "{number of commits: initial + fix iterations}",
+    "cardEmission": "emitted:<path> | emitted:<path>+refresh-warn | skipped:no-root | skipped:no-tool | skipped:outcome-<value> | error:<one-line>"
   },
   "issues": [
     { "stage": "{stage}", "type": "{issue_type}", "description": "{description}" }
@@ -406,7 +504,7 @@ For aborted runs, also set:
 
 All paths are relative to this skill's base directory (resolved from the symlink, i.e., the skill's source directory):
 
-1. **`runs/data.json`** — Read the existing file (create if missing with `{"skill":"ship","lastRun":null,"totalRuns":0,"runs":[]}`). Append the new run record to the `runs` array. If `runs.length > 20`, remove the oldest entries to keep exactly 20 (older runs are permanently discarded). Increment `totalRuns` by 1. Set `lastRun` to the run's timestamp. Write the file.
+1. **`runs/data.json`** — Read the existing file (create if missing with `{"skill":"ship","lastRun":null,"totalRuns":0,"runs":[]}`). Append the new run record to the `runs` array. If `runs.length > 50`, remove the oldest entries to keep exactly 50 (older runs are permanently discarded). Increment `totalRuns` by 1. Set `lastRun` to the run's timestamp. Write the file.
 
 2. **`runs/run.log`** — Append one line: `{timestamp} | {outcome} | {durationSeconds}s | {summary}`. If the log exceeds 100 lines, trim the oldest lines to keep exactly 100.
 
@@ -415,6 +513,70 @@ All paths are relative to this skill's base directory (resolved from the symlink
 - **Always record**, even on abort. A "nothing to ship" abort is still a run worth tracking (it reveals invocation patterns).
 - **Do not fail the pipeline** if recording fails (e.g., file permission error). Log a warning and continue.
 - **Resolve the skill base directory** from the symlink target, not the current working directory. The runs/ folder lives alongside SKILL.md.
+
+## Stage 10 -- CARD (decision card emission, success runs only)
+
+Print the status line: `[SHIP 10/10] Emitting decision card...`
+
+**Stage 10 is the same class of "feels done, exits early" problem that Stage 9 itself was promoted to fix.** When card emission was a sub-stage nested inside Stage 9's text wall, operators treated `data.json` + `run.log` as "recording done" and bailed. Promoting it to a numbered stage with its own status line makes the final-final step visible in the pipeline progression. Like Stage 9, this stage is best-effort (never fails the pipeline) but the **decision to attempt it** is now unconditional for success runs.
+
+After the run record has been written to `runs/data.json` and `runs/run.log`, emit a working-memory decision card under the user's agent-working-memory tree if the user has opted in. This is how shipped work flows into the causal memory tier described in `.ai-workspace/plans/2026-04-15-agent-working-memory.md`.
+
+**Gating conditions — ALL must hold for emission to proceed. If any fails, skip silently and record the reason in `metrics.cardEmission`:**
+
+**IMPORTANT — run these gate checks as actual bash commands. Do NOT read the prose and guess the outcome; past /ship runs failed Stage 10 silently because the agent interpreted "check if X exists" as a prompt to substitute an assumption rather than invoke the filesystem. Execute the bash blocks below verbatim and branch on their exit codes / output.**
+
+1. **Memory root discoverable.** Either `$WORKING_MEMORY_ROOT` is set in the environment, OR the default path `~/.claude/agent-working-memory/` exists on disk. In **both** cases, the resolved root must contain a `tier-b/` subdirectory — if `$WORKING_MEMORY_ROOT` is set but has no `tier-b/` inside, the gate fails fast as `skipped:no-root` rather than cascading into a write-time error. If neither source resolves to a valid root: skip with `cardEmission: "skipped:no-root"`.
+
+   Concrete gate check (run this; pass iff it prints `root=<path>`):
+
+   ```bash
+   ROOT="${WORKING_MEMORY_ROOT:-$HOME/.claude/agent-working-memory}"
+   if [ -d "$ROOT/tier-b" ]; then
+     echo "root=$ROOT"
+   else
+     echo "skipped:no-root"
+   fi
+   ```
+
+2. **Mechanism tool discoverable.** The public mechanism repo's `src/write-card.mjs` must be reachable. Look for it at (a) `$WORKING_MEMORY_TOOL` if set, (b) `$HOME/coding_projects/agent-working-memory/src/write-card.mjs`, (c) a `memory` binary on `$PATH`. If none resolve: skip with `cardEmission: "skipped:no-tool"`.
+
+   Concrete gate check (run this; pass iff it prints `tool=<path>` or `tool=memory`):
+
+   ```bash
+   if [ -n "${WORKING_MEMORY_TOOL:-}" ] && [ -f "$WORKING_MEMORY_TOOL" ]; then
+     echo "tool=$WORKING_MEMORY_TOOL"
+   elif [ -f "$HOME/coding_projects/agent-working-memory/src/write-card.mjs" ]; then
+     echo "tool=$HOME/coding_projects/agent-working-memory/src/write-card.mjs"
+   elif command -v memory >/dev/null 2>&1; then
+     echo "tool=memory"
+   else
+     echo "skipped:no-tool"
+   fi
+   ```
+
+3. **Run outcome is `success`.** Aborted, partial, and failure runs do NOT emit cards — they add noise to the memory tier without adding signal. If outcome is anything other than `success`: skip with `cardEmission: "skipped:outcome-<value>"`. This gate is checked against the in-memory run outcome variable — no filesystem probe needed.
+
+**When all three gates pass, emit the card:**
+
+1. **Extract the WHY from the PR body.** Fetch the merged PR body via `gh pr view <pr-number> --json body -q .body`. Extract the Summary section: the text between `## Summary` and the next `##` heading. If the body has no `## Summary` heading, use the first 500 characters of the body as a fallback. Trim whitespace.
+2. **Derive card metadata.**
+   - `topic`: `ship-runs`
+   - `id`: `pr-<pr-number>-<slug>` where `<slug>` is the branch name with conventional prefix stripped (e.g., `feat/add-foo` → `add-foo`), lowercased, non-alphanumerics collapsed to `-`, truncated to 40 chars.
+   - `title`: the PR title verbatim.
+   - `created`: today's date in `YYYY-MM-DD` form.
+   - `pinned`: `false`.
+   - `tags`: `[]`. Auto-emitted cards are never pinned — they accumulate as an activity stream, not a rule set.
+3. **Card body.** The `## Decision` section contains the extracted Summary text. `## Context` and `## Consequences` can use placeholder text (`(auto-emitted by /ship Stage 10 on PR <num>)`) — these are machine-generated cards, not hand-curated rules, and the Decision field carries the signal.
+4. **Write the card.** Since `memory write` (the CLI subcommand) only fills the `## Decision` body slot and cannot accept frontmatter tweaks, write the card file directly via a heredoc or equivalent. Path: `<root>/tier-b/topics/ship-runs/<created>-<id>.md`. Create `ship-runs/` if missing.
+5. **Refresh the pocket card.** Invoke `node <mechanism-repo>/src/memory-cli.mjs refresh --root <root>` so `tier-a.md` reflects the new card. Best-effort; a refresh failure does not fail the pipeline.
+6. **Record the outcome.** On success with clean refresh: `cardEmission: "emitted:<relative-path-from-root>"`. On success with refresh failure: `cardEmission: "emitted:<relative-path-from-root>+refresh-warn"` — the card was written but the pocket card was not updated (it will catch up on next `memory refresh` or session start). On any error during extraction or writing (before the card exists on disk): `cardEmission: "error:<one-line-reason>"` — the pipeline proceeds regardless.
+
+**Graceful degradation is mandatory.** This stage NEVER fails the pipeline. Any error — missing tool, disk full, malformed PR body, refresh script crash — logs a warning, records the error in `metrics.cardEmission`, and continues. The ship pipeline is already complete by the time this stage runs; card emission is a bonus, not a contract.
+
+**Privacy note.** The card body is derived from the PR body, which is already public on GitHub. No new information leakage surface is introduced by copying it into the user's private content repo.
+
+**Why emission is conditional on success only.** The working-memory tier is for *decisions that shipped*. An aborted run is not a decision; a partially-merged release is ambiguous. Filtering to `success` keeps the card stream clean and makes the Tier A pocket card more valuable (no noise). If richer coverage is wanted later, a follow-up can open the gate to `partial`; do not expand the gate silently here.
 
 ---
 

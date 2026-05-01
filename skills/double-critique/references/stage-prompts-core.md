@@ -46,16 +46,18 @@ Use the Agent tool with this prompt:
 > 2. What it's trying to accomplish (goal, audience)
 > 3. Every specific claim, decision, or implementation item — listed explicitly
 >
-> Then search these knowledge-base files for anything relevant — proven patterns, anti-patterns, constraints, past mistakes:
-> - `hive-mind-persist/knowledge-base/01-proven-patterns.md`
-> - `hive-mind-persist/knowledge-base/02-anti-patterns.md`
-> - `hive-mind-persist/knowledge-base/03-design-constraints.md`
-> - `hive-mind-persist/knowledge-base/04-essential-core.md`
-> - `hive-mind-persist/knowledge-base/05-compliance-mechanics.md`
-> - `hive-mind-persist/knowledge-base/06-process-patterns.md`
-> - `hive-mind-persist/knowledge-base/07-measurement-reality.md`
+> Then ground your review in the FULL `hive-mind-persist/` tree — not just `knowledge-base/` + `memory.md`. The full tree has nine members; you MUST scan each one for content relevant to the document under review. Each finding you emit should cite ≥1 hive-mind-persist pattern ID, anti-pattern ID, design-rule ID, constitutional rule, or other ID-bearing artefact (e.g., "P17", "F58", "design-rule-12") when relevant — or explicitly note "no matching prior art found" if your search came up empty for that finding.
 >
-> Also read `hive-mind-persist/memory.md` if it exists.
+> The nine tree members to scan:
+> - `hive-mind-persist/constitution.md` — non-negotiable rules. A document that violates the constitution is broken regardless of how clever it is.
+> - `hive-mind-persist/design-rules.md` — opinionated design heuristics; document deviations need explicit rationale.
+> - `hive-mind-persist/design-system.md` — design-system invariants (colors, spacing, component shapes). Anything visual or structural must respect these.
+> - `hive-mind-persist/document-guidelines.md` — formatting, header, voice, and audience norms for documents in this repo.
+> - `hive-mind-persist/knowledge-base/` — proven patterns, anti-patterns, design constraints, essential core, compliance mechanics, process patterns, measurement reality (the original 7 KB files plus any newer additions).
+> - `hive-mind-persist/memory.md` — chronological measurement log; check for past data on whatever the document claims.
+> - `hive-mind-persist/proposals/` — open and accepted proposals. The document may already be subsumed by an in-flight proposal, or may need to defer to one.
+> - `hive-mind-persist/session-notes/` — durable session-level decisions and outcomes from prior runs. Check for prior attempts at the same problem.
+> - `hive-mind-persist/case-studies/` — write-ups of specific incidents, failures, or successes. Often the most relevant precedent for novel decisions.
 >
 > For each finding, explain in plain language WHY it matters for this document. Like checking a cookbook's advice against what actually worked in your kitchen.
 >
@@ -144,8 +146,8 @@ Use the Agent tool with this prompt:
 > TEST CASE MECHANICAL SELF-CHECK (mandatory when the document contains test cases):
 > After drafting, if your output contains ANY test cases, assertions, grep commands,
 > or verification scripts, mechanically check EACH one:
-> (a) **ESM compatibility:** No `require()` — use `import` only. No `module.exports` — use `export`.
->     If the project uses ESM (check package.json for `"type": "module"`), every TC must comply.
+> (a) **Runtime compatibility:** Each TC must be executable by the target project's declared runtime. Inspect `package.json` `"type"` (or equivalent runtime marker) and confirm each TC's constructs are consistent with it. Do NOT prescribe specific syntax in the document (no "use `import`, not `require()`"-style rules) — the executor chooses the shape.
+>     Ask: "Would this TC run without modification on the target runtime?" If no, flag the incompatibility; do not rewrite with pinned syntax.
 > (b) **Assertion target accuracy:** The assertion must test the CORRECT data source.
 >     Ask: "If the feature being tested is completely broken, would this assertion still pass?"
 >     If yes, the assertion is trivially true and must be rewritten.
@@ -153,14 +155,15 @@ Use the Agent tool with this prompt:
 >     YAML uses `.yaml`/`.yml`. Never put one format's content in another format's extension.
 > (d) **Precondition realism:** Each TC must set up state that exercises the code path.
 >     Ask: "Does this test pass even if the feature was never implemented?" If yes, fix preconditions.
-> (e) **Async correctness:** Every `async` function must contain `await`. Async callbacks
->     must be promisified or awaited. Signal handlers must use `void asyncFn()` pattern,
->     not bare `async () => {}`. Use `n/a` if the TC has no async code.
-> (f) **Resource cleanup:** Tests that create files, servers, or child processes must clean
->     them up. Cleanup must handle the failure path (use `finally` or `afterEach`).
+> (e) **Async observability:** Each async TC must observably fail (not silently pass) when the feature under test throws or hangs.
+>     Ask: "If the awaited operation rejects or never resolves, does the TC report the failure?" If no, the TC is unsound.
+>     Do NOT prescribe specific async syntax (no "use `void asyncFn()` pattern"-style rules). Use `n/a` if the TC has no async code.
+> (f) **Resource cleanup:** Tests that create files, servers, or child processes must guarantee cleanup even when the test fails mid-run.
+>     Do NOT prescribe the cleanup mechanism (no "use `finally` or `afterEach`"-style rules) — the executor picks the shape.
 >     Use `n/a` if no resources are created.
-> (g) **Path anchoring:** File paths must use `import.meta.url` (ESM) or `__dirname` (CJS),
->     not `process.cwd()` or bare relative paths. Use `n/a` if the TC has no file paths.
+> (g) **Path portability:** TCs must resolve file paths consistently regardless of the caller's current working directory.
+>     Ask: "Would this TC pass if run from a different CWD?" If no, flag the CWD-dependency.
+>     Do NOT prescribe the anchoring mechanism (no "use `import.meta.url`" or "use `__dirname`"-style rules). Use `n/a` if the TC has no file paths.
 >
 > For each TC, write: `TC-CHECK: [TC name] — ESM:ok/fail, target:ok/fail, ext:ok/fail, precond:ok/fail, async:ok/fail/n/a, cleanup:ok/fail/n/a, paths:ok/fail/n/a`
 > Fix any failures before proceeding. Unfixed TC failures count as Drafter regressions.
@@ -186,7 +189,13 @@ Use the Agent tool with this prompt:
 >
 > Read the document at `{CORRECTED_DOC_PATH}`. Read it cold.
 >
-> Read the severity rubric at `references/severity-rubric.md`. This rubric defines the severity levels (CRITICAL / MAJOR / MINOR), the `blocks_ship` flag, the evidence requirement, and the required JSON output schema. Your output MUST conform to that schema exactly.
+> The severity rubric is embedded inline below. The orchestrator captured it once at run-start (Stage 0 step 4a) and substituted it here, so every round of this run sees byte-identical rubric text. **Do not look up `references/severity-rubric.md` at runtime** — use the inline text only. Your output MUST conform to the JSON schema described inline — including the mandatory `doctrine` field on every finding.
+>
+> ```
+> <!-- SEVERITY RUBRIC -->
+> ```
+>
+> The block above is the orchestrator's substitution point. Treat the substituted text as the authoritative rubric for this round.
 >
 > DOCUMENT IDENTITY CHECK (mandatory first step):
 > Before reviewing, read the first 10 lines of the document. State the document's
@@ -213,13 +222,25 @@ Use the Agent tool with this prompt:
 > - `UNVERIFIED` findings are allowed when you suspect a problem but cannot cite evidence. They are logged but **cannot be `blocks_ship: true`** — the orchestrator will not count them toward the blocker total regardless of what you set.
 > - If you cannot cite evidence for a finding AND cannot articulate the concern in plain language, do not emit it. Silence is better than noise.
 >
+> HIVE-MIND-PERSIST GROUNDING (Bundle 2c — mechanical contract):
+> - Every finding MUST cite ≥1 hive-mind-persist pattern ID, anti-pattern ID, design-rule ID, or constitutional rule (e.g., "P17", "F58", "design-rule-12", "constitution: File-over-memory") in its `finding` body OR explicitly note "no matching prior art found" if your search of the hive-mind-persist tree came up empty for that finding. Do NOT invent IDs; if you cannot cite a real pattern ID, say so explicitly with the "no matching prior art found" phrase.
+> - This is the mechanical grounding-enforcement — without it, isolated critics review the document in a vacuum and miss the precedents that already settle most novel-looking concerns.
+>
 > `blocks_ship` FLAG (hard rule from the rubric):
 > - `blocks_ship: true` iff a competent reviewer would reject the document at merge time for this specific finding.
 > - Polish, phrasing, stylistic preference, and optional strengthening are **never** `blocks_ship: true`.
 > - When `blocks_ship: true`, you MUST also provide a one-sentence `why_blocks_ship` field describing the merge-gate impact.
 >
+> `doctrine` FLAG (hard rule from the rubric, v1.2):
+> - Every finding MUST carry a `doctrine` field with value `outcome-defect` or `how-defect`. Missing or other values cause the orchestrator to abort the pipeline.
+> - **`outcome-defect`** — the document fails as a *what/why* artefact (missing AC, contradictory invariant, broken cross-reference, identity mismatch, unsupported claim the document itself makes). The fix lives inside the document.
+> - **`how-defect`** — the document is fine as a *what/why* artefact but you wish it prescribed *how* (exact bash, regex syntax, env-var name, mechanism choice, command pinning). The fix would push implementation choice into the plan, violating the "Plan Intent: What and Why, Never How" doctrine.
+> - When in doubt, ask: "If I were the executor with fresh code context, would I want the plan to choose this for me?" If the answer is "no, I'd rather choose myself" → `how-defect`. If the answer is "yes, this is a *what/why* I need decided up front" → `outcome-defect`.
+> - "Overly vague items that need specifics" is THE category most prone to misclassification. Re-read the cited evidence: if the document has named the *outcome* and you only wish it had pinned the *mechanism*, that is a `how-defect`. Do not let "vague" pull you toward HOW-prescription.
+> - The orchestrator does NOT count `how-defect` findings toward `blocker_count`, mirroring the `UNVERIFIED` mechanic. They are recorded for audit; the corrector's Doctrine guard will defer them with reason `planner-doctrine`.
+>
 > OUTPUT FORMAT (mandatory):
-> Write a single JSON array of findings inside a fenced code block, followed by any free-text observations below the block. The orchestrator parses the JSON array only — free text is for the user. No prose allowed inside the code block; the fence must contain valid JSON and nothing else.
+> Write a single JSON array of findings inside a fenced code block, followed by any free-text observations below the block. The orchestrator parses the JSON array only — free text is for the user. No prose allowed inside the code block; the fence must contain valid JSON and nothing else. Every finding MUST include `doctrine` — a finding without it fails JSON parse with a clear error.
 
 Write the output to `tmp/dc-{2*N+1}-critic-round{N}.md`.
 
@@ -235,17 +256,52 @@ Use the Agent tool with this prompt:
 > - The latest corrected document at `{CORRECTED_DOC_PATH}`
 > - The critic findings at `{CRITIC_FINDINGS_PATH}`. The findings are a JSON array inside a fenced code block — parse them.
 >
-> APPLY FIXES ONLY TO BLOCKING FINDINGS:
-> - For each finding where `blocks_ship == true`: apply the fix precisely. Do not add new content beyond what the finding requires.
-> - For each finding where `blocks_ship == false` (MINOR, polish, non-blocking): **do NOT fix it.** Instead, append the finding as a comment inside a block at the very end of the document:
+> DOCTRINE GUARD (mandatory first pass, v1.2):
+>
+> Before applying ANY fix, walk every finding and classify by its `doctrine` field. The plan you are correcting is an *intent* document — it carries WHAT and WHY, not HOW. The executor downstream has fresher code context than the plan author and chooses HOW. Your job is to fix WHAT/WHY defects, NOT to push HOW into the plan.
+>
+> - For each finding where `doctrine == "how-defect"`: **DO NOT apply the fix to the document.** Instead, defer it to the comment block (see deferred-comment template below) with reason `planner-doctrine: executor's call`. Even if `blocks_ship: true` was set on the finding, you must NOT pin commands, env-var names, regex syntax, mechanism choices, or any implementation detail that an executor with code context could reason about.
+> - For each declined `how-defect` finding, write one paragraph in your agent output explaining why deferral was correct. Format: `DOCTRINE-DEFER [F#]: <one-sentence reason naming what would have been pinned>`. Silent deferrals are forbidden — the user must be able to audit your reasoning.
+>
+> Concrete deferral examples (the ≥3 reference cases — match the *shape* of the finding, not the exact words):
+>
+> 1. **Pinning an env-var name.** Critic finding: "The plan says 'reads heartbeat path from env var (test seam)' — should specify `CAIRN_HEARTBEAT_LOG`." → DEFER. The plan named the *outcome* (env-var test seam exists); the *exact name* is the executor's choice. Pinning it locks the plan to a name the executor may need to change for collision/clarity reasons. Output: `DOCTRINE-DEFER [F#]: would have pinned env-var name; outcome (test-seam exists) is already in the plan, name is executor's call.`
+>
+> 2. **Pinning a regex.** Critic finding: "The plan says 'extracts the audit-log moved-to commit ref' — should specify the exact pattern e.g. `grep -E 'audit-log moved to .* see (#\\d+|[0-9a-f]{7,40})'`." → DEFER. The plan named the *outcome* (commit ref is extracted); the *exact regex* is the executor's call and is likely to need iteration against real data. Output: `DOCTRINE-DEFER [F#]: would have pinned regex; outcome (extract commit ref) is already in the plan, pattern is executor's call.`
+>
+> 3. **Pinning a touch-mtime mechanism.** Critic finding: "The plan says 'simulate stale heartbeat' — should specify `touch -d '12 hours ago' <file>`." → DEFER. The plan named the *outcome* (simulated stale state); `touch -d` is GNU-only, and the executor may use Node `fs.utimesSync`, PowerShell, or any other mechanism. Pinning it would have caused round-2 critic to flag "GNU-only" as a fresh blocker. Output: `DOCTRINE-DEFER [F#]: would have pinned touch-mtime mechanism; outcome (simulated stale heartbeat) is already in the plan, mechanism is executor's call.`
+>
+> Additional deferral patterns (apply same logic):
+> - Exact bash command sequences for setup/cleanup steps.
+> - Specific jq function choice (`test()` vs `endswith()`).
+> - Exact cron expression or PM2 ecosystem-config field shape.
+> - Specific commit-message prefix or branch-name format.
+> - Exact retry/backoff timings or thresholds beyond the WHY-stated bound.
+>
+> Edge case — a `how-defect` finding may legitimately need a `how`-shaped fix when the document IS the script (release scripts, lint configs, ecosystem files). In that rare case the critic should have classified it `outcome-defect` (the script's command shape *is* the outcome). If the critic mis-classified, override only with explicit reasoning in your agent output: `DOCTRINE-OVERRIDE [F#]: applying despite how-defect flag because document is a script not a plan; <evidence>`.
+>
+> APPLY FIXES ONLY TO BLOCKING OUTCOME-DEFECT FINDINGS:
+> - For each finding where `doctrine == "outcome-defect"` AND `blocks_ship == true`: apply the fix precisely. Do not add new content beyond what the finding requires.
+> - For each finding where `doctrine == "outcome-defect"` AND `blocks_ship == false` (MINOR, polish, non-blocking): **do NOT fix it.** Instead, append the finding as a comment inside the deferred block at the very end of the document (template below).
+> - For each finding where `doctrine == "how-defect"`: defer regardless of `blocks_ship` — the Doctrine guard above governs.
+>
+> HIVE-MIND-PERSIST GROUNDING (Bundle 2c — mechanical contract):
+> - When applying a fix, cite ≥1 hive-mind-persist pattern ID, anti-pattern ID, design-rule ID, or constitutional rule in the corrected text where the fix lands (e.g., a footnote reference like "(P17)" or an inline citation like "per design-rule-12"). If your search of the hive-mind-persist tree came up empty for the fix, explicitly note "no matching prior art found" rather than fabricate an ID. This makes the corrector's grounding auditable from the corrected document alone.
+>
+> DOWNSIDES-ACCEPTED SECTION (Bundle 2c — mandatory for clean exit):
+> - Before ending the round, ensure the corrected document contains a `## Downsides accepted` section with at least one entry. Each entry is one bullet of the form `- <finding-id or short-name>: <one-sentence rationale for accepting rather than fixing>`.
+> - If this round genuinely produced zero accepted trade-offs (everything was either resolved or escalated), the section MUST still exist with one explicit no-op entry — sample wording: `- (none) — no accepted trade-offs in this round; all findings either resolved or escalated.`
+> - An empty or missing `## Downsides accepted` section will block the loop's clean-exit gate (see SKILL.md Stages 3..N exit checks). Silence is not allowed.
+> - Deferred-comment block template (one block per round, all deferrals from this round inside it):
 >   ```
 >   <!-- deferred:critic-{N}
->   - [F#] <finding text>
+>   - [F#] (reason: minor) <finding text>
+>   - [F#] (reason: planner-doctrine: executor's call) <finding text>
 >   ...
 >   -->
 >   ```
 >   These are preserved for the user to read but do not modify document content.
-> - For any finding you believe is wrong (blocking or not): explain why in plain language in your agent output. Do NOT silently skip a `blocks_ship: true` finding.
+> - For any finding you believe is wrong (blocking or not): explain why in plain language in your agent output. Do NOT silently skip a finding that you decline to apply.
 >
 > SECOND-ORDER EFFECT CHECK (mandatory after applying each blocking fix):
 > After applying each fix, check all four dimensions and write:

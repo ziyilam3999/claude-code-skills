@@ -31,7 +31,7 @@ Run each check. Record result as PASS / FAIL / WARN.
 | R3 | `runs/data.json` exists with valid structure | Read and parse JSON, check for `skill`, `lastRun`, `totalRuns`, `runs` keys | FAIL |
 | R4 | `runs/run.log` exists | Check path | FAIL |
 | R5 | Recording section specifies outcome values | Grep for any outcome enum listing (e.g., `complete\|no-action\|error`, `success\|fail`, or similar pipe-separated values) | WARN |
-| R6 | Recording section specifies "keep last 20 runs" | Grep for retention policy | WARN |
+| R6 | Recording section specifies "keep last 50 runs" | Grep for retention policy | WARN |
 
 ## 4. Improvability
 

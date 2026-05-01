@@ -1,5 +1,6 @@
 ---
 name: checkpoint
+version: 1.0.1
 description: Session checkpoint that consolidates progress and prepares for continued work. Use when the user says "/checkpoint", "checkpoint", "save progress", "where was I", or wants to update their plan, trim stale context, and see next steps. Also use when resuming a session or before context gets too large.
 ---
 
@@ -75,6 +76,7 @@ Append to `runs/data.json` (create with `{"skill":"checkpoint","lastRun":null,"t
   "timestamp": "{ISO-8601}",
   "outcome": "saved|no-plan|all-complete",
   "project": "{current project directory name}",
+  "trigger": "{invocation string — e.g. '/checkpoint' or '/checkpoint save'}",
   "planFile": "{relative path to plan file or null}",
   "itemsCompleted": "{N items marked complete this run}",
   "itemsRemaining": "{N unchecked items}",
@@ -83,7 +85,9 @@ Append to `runs/data.json` (create with `{"skill":"checkpoint","lastRun":null,"t
 }
 ```
 
-Keep last 20 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
+The `trigger` field was added 2026-04-15 per `/skill-evolve improve` findings — historical runs had it missing, making cross-skill telemetry inconsistent. New runs should populate it; readers should treat missing `trigger` as `null` (not an error) for backward compatibility with pre-v1.0.1 data.
+
+Keep last 50 runs (older runs are permanently discarded). Set `lastRun` and increment `totalRuns`.
 
 Append one line to `runs/run.log` (keep last 100 lines):
 ```
