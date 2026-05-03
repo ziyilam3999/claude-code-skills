@@ -285,6 +285,36 @@ Version bump + changelog land on master via a **squash-merged release PR**, not 
 1. **Check if repo is releasable:** Look for `package.json` at the repo root.
    - If not found: log "No package.json -- skipping release." Proceed to Stage 8.
 
+   <!-- BLOCK-4-N4-STASH-CHECK-START -->
+   **Pre-release stash check (Block 4 N4).** Stashes are per-clone in `.git/refs/stash`, so this check runs on the primary clone *before* step 6 forks off a fresh release worktree. Soft warning, not a gate.
+
+   ```bash
+   # Test mode: SHIP_STAGE7_TEST=1 suppresses real release operations so the
+   # acceptance harness can exercise this block in isolation.
+   STAGE7_STASH_HITS="$(git stash list 2>/dev/null \
+       | grep -E '(pre-v[0-9]|drain-stage|v[0-9]+\.[0-9]+|q[0-9]+(-[A-Za-z0-9_-]+)?-)' \
+       || true)"
+   if [ -n "$STAGE7_STASH_HITS" ]; then
+     echo "[ship] Stage 7 found release-relevant stash:"
+     printf '%s\n' "$STAGE7_STASH_HITS"
+     echo "[ship] Soft warning — review or drop these stashes before continuing."
+     # Default action: continue. Operator may abort manually.
+     if [ "${SHIP_STAGE7_TEST:-0}" != "1" ]; then
+       echo "[ship] Continuing in 5s (Ctrl+C to abort)..."
+       sleep 5
+     fi
+   fi
+   ```
+
+   Regex anchors:
+   - `pre-v[0-9]` — pre-version-bump scratch (e.g. `pre-v0.34.3-executor`)
+   - `drain-stage` — drain-stage release scratch
+   - `v[0-9]+\.[0-9]+` — explicit version-marker stashes
+   - `q[0-9]+(-...)?-` — quarter/sprint scratch (e.g. `q05-q1-gitignore-pre-existing-noise`)
+
+   The check is a soft warning. Default behavior continues the pipeline (no abort). The `SHIP_STAGE7_TEST=1` env var lets `tests/ship/stage-7-stash-check-acceptance.sh` exercise this block without invoking the rest of Stage 7.
+   <!-- BLOCK-4-N4-STASH-CHECK-END -->
+
 2. **Get last tag (read-only on master):**
    ```bash
    git fetch origin master --tags
@@ -383,6 +413,61 @@ if [ "$GIT_DIR" = "$GIT_COMMON_DIR" ]; then
   git checkout master && git pull
   git branch -d {branch} 2>/dev/null   # delete local if still exists
   rm -f .ai-workspace/ship-verified-{pr-number}   # clean up verification marker
+
+  # L1-B [gone]-prune (repo-hygiene-prevention plan): after the pull, any
+  # locals whose origin upstream was deleted on PR merge are vestigial.
+  # Delete them silently UNLESS they carry unpushed work (commits not in
+  # origin/master). Per-branch ≤50ms, total ≤500ms; failures are non-fatal.
+  git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads 2>/dev/null \
+    | grep '\[gone\]' | awk '{print $1}' \
+    | while read -r gone_branch; do
+        [ -z "$gone_branch" ] && continue
+        # Preserve unmerged work: skip if the branch has commits not in origin/master.
+        unpushed="$(git log "$gone_branch" --not origin/master --oneline 2>/dev/null | head -1)"
+        if [ -z "$unpushed" ]; then
+          git branch -D "$gone_branch" >/dev/null 2>&1
+        fi
+      done
+
+  # L1-C fast-forward primary (repo-hygiene-prevention plan): leave the
+  # primary clone exactly at origin/master so a stale-primary PR-from-primary
+  # accident can't happen. Fast-forward only — never destructive.
+  #
+  # FF-skip sentinel (prevent-primary-clone-drift plan, 2026-05-02):
+  # When the FF skips (dirty tree, non-FF history, etc.), write a structured
+  # sentinel file at $HOME/.claude/.ship-stage8-skipped.log so SessionStart
+  # consumers (hooks/session-bookmark.sh) can surface a gap-independent
+  # _NUDGE: line. Single line, key=value space-separated, last-event-wins.
+  # On a successful FF, delete any stale sentinel so a one-time skip does
+  # not surface forever. F69 anti-pattern avoided (file-based sentinel,
+  # not stderr-grep across process boundaries); architectural precedent
+  # PR #438 (housekeep-runner status sentinel).
+  git fetch origin master --quiet 2>/dev/null
+  PRIMARY_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$PRIMARY_BRANCH" = "master" ]; then
+    SHIP_SENTINEL="${HOME}/.claude/.ship-stage8-skipped.log"
+    SHIP_FF_STDERR=$(git pull --ff-only origin master 2>&1 >/dev/null)
+    SHIP_FF_RC=$?
+    if [ "$SHIP_FF_RC" -eq 0 ]; then
+      # FF succeeded — delete any stale sentinel from a prior skip.
+      rm -f "$SHIP_SENTINEL" 2>/dev/null
+    else
+      # FF skipped — write structured sentinel for SessionStart surfacing.
+      SHIP_LOCAL_SHA=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+      SHIP_ORIGIN_SHA=$(git rev-parse origin/master 2>/dev/null || echo "unknown")
+      SHIP_GAP=$(git rev-list --count HEAD..origin/master 2>/dev/null || echo "unknown")
+      SHIP_DIRTY=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+      [ -z "$SHIP_DIRTY" ] && SHIP_DIRTY="n/a"
+      SHIP_TS=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)
+      # Replace newlines/whitespace in stderr so the sentinel stays single-line.
+      SHIP_FF_STDERR_ONELINE=$(printf '%s' "$SHIP_FF_STDERR" | tr '\n\r\t' '   ' | sed 's/  */ /g')
+      mkdir -p "${HOME}/.claude" 2>/dev/null
+      printf 'iso_ts=%s local_sha=%s origin_sha=%s gap=%s dirty_count=%s stderr=%s\n' \
+        "$SHIP_TS" "$SHIP_LOCAL_SHA" "$SHIP_ORIGIN_SHA" "$SHIP_GAP" "$SHIP_DIRTY" "$SHIP_FF_STDERR_ONELINE" \
+        > "$SHIP_SENTINEL"
+      echo "[ship] primary FF skipped (gap=$SHIP_GAP, dirty=$SHIP_DIRTY); sentinel written to $SHIP_SENTINEL — run 'git pull --ff-only origin master' manually after resolving the blocker"
+    fi
+  fi
 else
   # Secondary worktree (rule #12 case). Pull in the shared clone, remove
   # this worktree, delete the local branch, and prune the verification marker
@@ -398,6 +483,25 @@ else
   # clone path above — don't. That would yank HEAD out from under any
   # concurrent agent working in the shared clone.
   git pull
+
+  # L1-B [gone]-prune (repo-hygiene-prevention plan): in the shared clone,
+  # delete locals whose upstream is gone (preserve unpushed work). Same
+  # contract as the primary path above.
+  git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads 2>/dev/null \
+    | grep '\[gone\]' | awk '{print $1}' \
+    | while read -r gone_branch; do
+        [ -z "$gone_branch" ] && continue
+        unpushed="$(git log "$gone_branch" --not origin/master --oneline 2>/dev/null | head -1)"
+        if [ -z "$unpushed" ]; then
+          git branch -D "$gone_branch" >/dev/null 2>&1
+        fi
+      done
+
+  # NOTE: L1-C (fast-forward primary) is intentionally NOT applied here.
+  # The shared primary clone may legitimately be on a non-master branch for
+  # other agents (see comment above); blindly forcing master-FF would yank
+  # HEAD. The primary-clone branch above is the only path that asserts FF.
+
   git worktree remove "$WORKTREE_PATH" 2>/dev/null \
     || git worktree remove --force "$WORKTREE_PATH"
   git branch -d {branch} 2>/dev/null   # delete local if still exists
@@ -407,6 +511,10 @@ else
   git push origin --delete {branch} 2>/dev/null || true
 fi
 ```
+
+**Hygiene additions (L1-B + L1-C, from `.ai-workspace/plans/2026-05-02-repo-hygiene-warning-mechanisms.md`):**
+- L1-B: after the `git pull` in BOTH branches (primary + worktree), enumerate locals with `[gone]` upstreams and delete those with no unpushed work. Preserves unmerged commits.
+- L1-C: in the primary branch only, fast-forward primary clone to `origin/master` if HEAD is on master. Never destructive (FF-only).
 
 **Release-worktree quarantine** (runs after the feature-worktree branch above when Stage 7 created a release worktree). The release worktree at `.claude/worktrees/release-{version}` is no longer needed once the release PR has merged and the tag has been pushed. Move it (do NOT `rm -rf` — Rule 14) into a quarantine path, then prune the worktree registry:
 
@@ -577,6 +685,20 @@ After the run record has been written to `runs/data.json` and `runs/run.log`, em
 **Privacy note.** The card body is derived from the PR body, which is already public on GitHub. No new information leakage surface is introduced by copying it into the user's private content repo.
 
 **Why emission is conditional on success only.** The working-memory tier is for *decisions that shipped*. An aborted run is not a decision; a partially-merged release is ambiguous. Filtering to `success` keeps the card stream clean and makes the Tier A pocket card more valuable (no noise). If richer coverage is wanted later, a follow-up can open the gate to `partial`; do not expand the gate silently here.
+
+---
+
+## Final output
+
+User-facing reply at the end of a `/ship` invocation is capped at ≤5 lines. Stage-9 RECORD and Stage-10 CARD continue to write full data to `runs/data.json`, `runs/run.log`, and the working-memory tier-b card — those internal artefacts are unchanged. This cap governs only the prose Claude prints back to the user. Verbose detail is opt-in via `--verbose`; default is terse.
+
+- Outcome line: success/partial/abort + PR number + merge SHA (or abort reason).
+- Key metric line: stages run, CI pass count, review iterations, release tag (if any).
+- Pointer line: `see skills/ship/runs/run.log for full history`.
+- Last status line: card-emission status (`emitted:<path>` / `error:<reason>`) when Stage 10 ran.
+- (blank line)
+
+Grounded in F20 (Verbose Gate Ceremony vs Brevity Directive) — the platform's terseness preference wins every conflict; the skill must produce a compact final reply by design rather than relying on the agent to compress it post-hoc.
 
 ---
 

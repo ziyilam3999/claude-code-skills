@@ -1,16 +1,17 @@
 ---
 name: double-critique
-version: 1.4.0
+version: 1.5.0
 description: >
   Deep multi-agent critique pipeline that finds logical gaps, unsupported claims, missing edge
   cases, and internal contradictions in any document — then fixes them. Two independent critics
   review the document cold (seeing nothing about how it was made) to catch problems the author
-  is blind to. Use when the user wants to review, critique, stress-test, or improve a PRD,
-  SPEC, design doc, plan, RFC, or any important document before it ships. Also use when the
-  user says "critique this", "review this document", "find problems in", "stress test",
-  "is this document solid", "what did I miss", "double critique", "run critique pipeline",
-  "/double-critique path/to/file". Do NOT use for simple proofreading, grammar fixes, or formatting
-  — this is a deep structural and logical review.
+  is blind to. Sweet spot is outcome-focused plans (WHAT+WHY); the doctrine guard and mid-loop
+  drift-into-how detection keep HOW-creep out across the loop. Use when the user wants to review,
+  critique, stress-test, or improve a PRD, SPEC, design doc, outcome plan, RFC, or any important
+  document before it ships. Also use when the user says "critique this", "review this document",
+  "find problems in", "stress test", "is this document solid", "what did I miss", "double critique",
+  "run critique pipeline", "/double-critique path/to/file". Do NOT use for simple proofreading,
+  grammar fixes, or formatting — this is a deep structural and logical review.
 ---
 
 # Double-Critique Pipeline
@@ -33,7 +34,7 @@ Severity (CRITICAL / MAJOR / MINOR — defined in `references/severity-rubric.md
 
 - **`block`** — the finding is a defect the corrector MUST address before the loop can exit clean. The corrector edits the document to fix it. Failure to fix means the round does not converge.
 - **`iterate`** — the finding is a defect the corrector should address by editing the document, but it is not a hard merge-gate. Round-tripping through another corrector pass is acceptable; the loop's `max_rounds` cap protects against runaway iteration.
-- **`accept`** — the finding is a real concern the corrector chooses NOT to fix, with explicit named rationale. This is the disposition formerly labeled `ITERATE` in pre-Bundle-2c versions of this skill (the rename disambiguates it from the round-trip "iterate" disposition above). Accepted findings get recorded in the corrected document's `## Downsides accepted` section with one-line rationale per finding. Acceptance turns a real trade-off into an *explicit* trade-off — the document tells future readers "we know about this, here's why we shipped anyway."
+- **`accept`** — the finding is a real concern the corrector chooses NOT to fix, with explicit named rationale. This disposition is introduced as the third disposition (replacing the implicit re-loop behavior of pre-Bundle-2c versions), and is named `accept` to keep it distinct from the round-trip "iterate" disposition above. Accepted findings get recorded in the corrected document's `## Downsides accepted` section with one-line rationale per finding. Acceptance turns a real trade-off into an *explicit* trade-off — the document tells future readers "we know about this, here's why we shipped anyway."
 
 The disposition axis crosses severity to form a 3×3 guidance matrix. Use this table when classifying findings:
 
@@ -56,13 +57,15 @@ The core insight: authors can't see their own blind spots. When you write a docu
 
 Each stage is an independent Agent subagent. No shared context between stages — only file artifacts passed forward. Each agent receives at most 2 inputs: the original document + one prior artifact. Critics are fully isolated: they see ONLY the document, nothing else.
 
+The pipeline's sweet spot is **outcome-focused plans** (WHAT+WHY only, binary AC, mechanism left to the executor). Multi-round loops are the right tool for outcome plans because (a) one isolated critic's correction can introduce a contradiction only the *next* round's critic spots, and (b) outcome plans are exactly the documents where /auto-flow's single-pass P1→P2→P3→P4 reviewer chain cannot loop back. The loop's `how-defect` doctrine filter (severity rubric line 46) and mid-loop drift-into-how check (loop step 8) keep the corrector from pinning HOW under critic pressure — those two mechanical safety nets, not the Stage 0 gate, are what make it safe to escalate outcome plans here.
+
 ## How to Use
 
 ```
 /double-critique path/to/document.md [--force]
 ```
 
-Works on prescriptive document types: PRD, SPEC, design doc, **prescriptive** implementation plan, RFC, architecture decision record. Does NOT work on outcome-focused plans (the kind with binary AC that intentionally omit pinned commands) — the Stage 0 sweet-spot pre-flight hard-blocks those and redirects to `/coherent-plan`. The `--force` flag overrides the Shape-1 block for non-plan documents that happen to match the heuristic; it is a doctrine violation to use `--force` on an actual outcome plan. The pipeline creates a `tmp/` directory and writes each stage's output to `tmp/dc-{N}-{role}.md` for auditability.
+Works on **outcome-focused** document types: outcome plans (binary AC + WHAT/WHY only, no pinned commands), PRDs, SPECs, design docs, RFCs, architecture decision records. The Stage 0 sweet-spot pre-flight ARMS the pipeline for outcome plans — the loop's doctrine guard (`how-defect` filter at `references/severity-rubric.md:46`) and mid-loop drift-into-how detection (loop step 8) are the load-bearing safety nets that prevent HOW-creep across rounds. Does NOT work on **prescriptive HOW** plans (the kind that pin every command — `bash_blocks >= 10 AND doc_lines >= 300`) — the Stage 0 unbounded-how branch HARD BLOCKS those and redirects to `/coherent-plan` or to a leaner WHAT-rewrite. The `--force` flag overrides the unbounded-HOW block for **non-plan documents** that happen to match the heuristic (e.g. a SPEC with a long literal "deployment runbook" subsection); it is a doctrine violation to use `--force` on an actual implementation plan that has drifted into HOW. The pipeline creates a `tmp/` directory and writes each stage's output to `tmp/dc-{N}-{role}.md` for auditability.
 
 If `$ARGUMENTS` is empty or the file doesn't exist, stop and ask the user for the file path.
 
@@ -90,29 +93,30 @@ Before launching any agent, the orchestrator (you) performs these cleanup steps:
 3. **Delete all stale artifacts:** `mv tmp/dc-*.md tmp/dc-loop-state.json` to a quarantine path if any exist (per the global mv-not-rm rule). Empty quarantines may be cleared with `mv` afterwards. The fresh-state requirement matters because stages must not read leftover files from prior runs (Run 11 bug: Critic-2 reviewed a stale document from 3 days earlier). The loop-state file must also never survive across runs.
 4. Verify the source document at `$ARGUMENTS` exists and is non-empty.
 4a. **Freeze the severity rubric (Q3 — Bundle 0c).** Read `references/severity-rubric.md` ONCE into memory at run-start (cache the full text as `RUBRIC_FROZEN`). Every critic round in the loop receives this byte-identical text via `<!-- SEVERITY RUBRIC -->` marker substitution in the Critic-N prompt template. Do NOT re-read the rubric file mid-loop; do NOT let the per-round critic prompt fetch the file at agent runtime. The single read at run-start is what makes the rubric frozen across rounds — even if the file is edited mid-run (e.g., by an unrelated process), every round of THIS run uses the snapshot taken at run-start. Verification: see `scripts/severity-rubric-pinning.test.sh` (AC-8).
-5. **Sweet-spot pre-flight (v1.0.1, 2026-04-15):** double-critique's sweet spot is **bounded implementation plans**. Two shapes fall outside the sweet spot and cause oscillation for different reasons — classify the input document and emit a warning if it looks like either. Do NOT block; just advise the user before Stage 1 runs.
+5. **Sweet-spot pre-flight (v1.5.0, 2026-05-02 — inverted from v1.0.1):** double-critique's sweet spot is **outcome-focused plans (WHAT+WHY)** — the kind CLAUDE.md's "Plan Intent: What and Why, Never How" doctrine elevates. Prescriptive HOW plans with unbounded surface area now fall OUTSIDE the sweet spot and are hard-blocked. Classify the input document, emit the appropriate Stage 0 message, and either arm the pipeline or halt accordingly.
 
-   **Detection heuristic (cheap, read-only):**
+   **Detection heuristic (cheap, read-only — thresholds unchanged from v1.0.1):**
    - `bash_blocks` = count of fenced code blocks tagged `bash`/`sh`/`shell` in the document.
    - `ac_markers` = count of lines matching `(?i)^#+\s*(binary\s*ac|goal|invariant|outcome|out\s*of\s*scope)` — headings that signal outcome-focused structure.
    - `doc_lines` = total non-blank lines.
 
-   **Shape 1 — outcome/what-focused (HARD BLOCK — redirect to /coherent-plan):** `ac_markers >= 3 AND bash_blocks <= 2`. These plans deliberately omit pinned commands; isolated critics keep flagging "exact bash is missing" as a defect, AND the Drafter drifts into prescribing HOW when it "fixes" those findings. Running double-critique on outcome plans therefore violates the CLAUDE.md doctrine "Plan Intent: What and Why, Never How" by pushing implementation prescriptions into the plan's AC. Halt immediately — do NOT proceed to Stage 1. Emit:
+   **Sweet spot — outcome-focused (PIPELINE ARMED):** `ac_markers >= 3 AND bash_blocks <= 2`. These plans name *what* must be true and let the executor pick *how*. The loop's doctrine guard (`how-defect` filter at `references/severity-rubric.md:46`) and mid-loop drift-into-how detection (loop step 8) prevent HOW-creep across rounds. Emit a one-line confirmation and proceed to Stage 1:
    ```
-   ✗ double-critique: input looks outcome-focused ({ac_markers} AC-style headings, {bash_blocks} bash blocks). This skill is built for prescriptive implementation plans; running it on an outcome plan violates the "plans focus on WHAT+WHY, never HOW" doctrine because the Drafter will push implementation syntax into the plan's AC. Use /coherent-plan instead.
-
-   If this is not a plan (e.g. a strategy memo or SPEC that happens to match the heuristic), re-run with --force to override. Overriding on an actual plan is a doctrine violation — do not override to silence the gate.
+   ✓ double-critique: input is outcome-focused ({ac_markers} AC-style headings, {bash_blocks} bash blocks) — this is the post-v1.5 sweet spot; pipeline armed; doctrine guard + drift-into-how detection enforced across rounds.
    ```
-   Exit 0 without continuing to Stage 1. Record `"sweetSpotShape": "outcome"` and `"blockedAtPreFlight": true` in `tmp/dc-loop-state.json` for effectiveness tracking. The `--force` flag reinstates the old behavior (emit warning, proceed) for the non-plan edge case only.
+   Record `"sweetSpotShape": "outcome"` in `tmp/dc-loop-state.json` for effectiveness tracking and seed `shapeTransitions` (see below).
 
-   **Shape 2 — how-focused with unbounded nit surface area (perspective-diversity trap):** `bash_blocks >= 10 AND doc_lines >= 300`. These plans pin every command; each perspective-isolated critic round (see line 90 "Critics are fully isolated") finds DIFFERENT nits at similar counts, and even the v1.0.1 strict `>` rule can't fully protect against it. Emit:
+   **HARD BLOCK — prescriptive HOW with unbounded nit surface area:** `bash_blocks >= 10 AND doc_lines >= 300`. These plans pin every command; each perspective-isolated critic round (see "Critics are fully isolated" below) finds DIFFERENT nits at similar counts, and the loop oscillates without converging. They also violate the CLAUDE.md "Plan Intent: WHAT+WHY, never HOW" doctrine by leaving the executor no mechanism choice. Halt immediately — do NOT proceed to Stage 1. Emit:
    ```
-   ⚠ double-critique: input has {bash_blocks} bash blocks across {doc_lines} lines — this is the how-focused shape that causes perspective-diversity oscillation. Isolated critics will each find their own set of nits; the loop may exhaust max_rounds without converging. Consider scope-cutting the plan or switching to /coherent-plan. Proceeding anyway.
+   ✗ double-critique: input is prescriptive/how-focused ({bash_blocks} bash blocks across {doc_lines} lines) — HARD BLOCK. Plans focus on WHAT+WHY, never HOW (CLAUDE.md). Rewrite as outcomes + intent (binary AC, mechanism left to the executor) before re-running, or escalate to /coherent-plan if the rewritten plan is small enough. Halt immediately — do NOT proceed to Stage 1.
+
+   If this is NOT a plan (e.g. a SPEC, PRD, or RFC with a long literal "deployment runbook" subsection that incidentally exceeds the threshold), re-run with --force to override. --force on an actual implementation plan is a doctrine violation — rewrite the plan as WHAT+WHY instead of overriding the gate.
    ```
+   Exit 0 without continuing to Stage 1. Record `"sweetSpotShape": "unbounded-how"` and `"blockedAtPreFlight": true` in `tmp/dc-loop-state.json`. The `--force` flag overrides this hard-block for the non-plan edge case only.
 
-   **Both shapes / ambiguous:** if the document matches neither shape OR both shapes, skip the warning silently. The sweet spot is "prescriptive-but-bounded" — neither extreme.
+   **Both shapes / ambiguous:** if the document matches neither sweet-spot nor unbounded-how (or both), skip the message silently and proceed. The pipeline runs with `"sweetSpotShape": "in-sweet-spot"` recorded for the mid-loop drift baseline. The sweet spot is outcome-focused and bounded; ambiguous inputs are advisory-pass.
 
-   Emit the Shape-2 warning or Shape-1 hard-block message ONCE before Stage 1. Do not re-emit inside the critic loop. **Shape 1 halts the pipeline at Stage 0** (unless `--force` was passed on a non-plan document); Shape 2 is advisory and the pipeline continues. Record the detected shape in `tmp/dc-loop-state.json` as `"sweetSpotShape": "outcome" | "unbounded-how" | "in-sweet-spot"` for Stage 9 effectiveness tracking. When Shape 1 halts, also record `"blockedAtPreFlight": true`. **v1.2 mid-loop seed:** also seed `"shapeTransitions": ["<detected-shape>"]` so the per-round drift check (loop step 8) has a baseline to compare against.
+   Emit the sweet-spot confirmation OR the unbounded-how hard-block message ONCE before Stage 1. Do not re-emit inside the critic loop. **Unbounded-how halts the pipeline at Stage 0** (unless `--force` was passed on a non-plan document); outcome-shaped and ambiguous inputs proceed. Record the detected shape in `tmp/dc-loop-state.json` as `"sweetSpotShape": "outcome" | "unbounded-how" | "in-sweet-spot"` for Stage 9 effectiveness tracking. When unbounded-how halts, also record `"blockedAtPreFlight": true`. **v1.2 mid-loop seed (unchanged):** also seed `"shapeTransitions": ["<detected-shape>"]` so the per-round drift check (loop step 8) has a baseline to compare against.
 
 ## Stages 1-2 — Single-shot Pre-Loop
 

@@ -61,6 +61,18 @@ Progress: {completed}/{total} items
 
 If all items are checked, print "All items complete -- plan is done." instead of next steps.
 
+## Final output
+
+User-facing reply at the end of a `/checkpoint` invocation is capped at ≤5 lines. The Run Data Recording stage below continues to write full data to `runs/data.json` and `runs/run.log` — that internal artefact is unchanged. This cap governs only the prose Claude prints back to the user.
+
+- Plan path line: `Plan: <relative-path>`.
+- Progress line: `Progress: <completed>/<total>`.
+- Next-up line: first unchecked item only (or `All items complete`).
+- Pointer line: `see skills/checkpoint/runs/run.log for full history`.
+- (blank line)
+
+Grounded in F20 (Verbose Gate Ceremony vs Brevity Directive) — checkpoint output decays to "ok" inside one turn; the long bulleted next-up list belongs in the plan file, not in the chat reply.
+
 ## Run Data Recording
 
 After showing next steps (or "nothing to checkpoint"), persist run data. This section always runs.
